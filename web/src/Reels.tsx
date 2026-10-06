@@ -4,7 +4,6 @@ type Acc = { id: string; username: string };
 type Reel = {
   id: string;
   username: string;
-  video_url: string;
   cover_url: string | null;
   caption: string;
   scheduled_at: string;
@@ -12,17 +11,15 @@ type Reel = {
   error: string | null;
 };
 type Lib = {
-  items: { id: string; video_url: string }[];
+  items: { id: string; tg_size: number | null }[];
   caption: string;
   coverUrl: string | null;
   accounts: number;
   plan: { slots: string[]; batch: number; tz: string };
+  telegram: { enabled: boolean; linked: boolean; code: string; bot: string | null };
 };
-type Sig = { cloudName: string; apiKey: string; timestamp: number; folder: string; signature: string };
-type Uploaded = { url: string; publicId: string };
 
-const MAX_VIDEO = 100 * 1024 * 1024;
-const MAX_COVER = 8 * 1024 * 1024;
+const MAX_COVER = 5 * 1024 * 1024;
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -35,53 +32,16 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-function uploadFile(file: File, kind: "video" | "image", sig: Sig, onProgress: (p: number) => void): Promise<Uploaded> {
-  return new Promise((resolve, reject) => {
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("api_key", sig.apiKey);
-    fd.append("timestamp", String(sig.timestamp));
-    fd.append("folder", sig.folder);
-    fd.append("signature", sig.signature);
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `https://api.cloudinary.com/v1_1/${sig.cloudName}/${kind}/upload`);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
-    };
-    xhr.onload = () => {
-      try {
-        const d = JSON.parse(xhr.responseText);
-        if (xhr.status >= 200 && xhr.status < 300) resolve({ url: d.secure_url, publicId: d.public_id });
-        else reject(new Error(d.error?.message ?? "Upload failed"));
-      } catch {
-        reject(new Error("Upload failed"));
-      }
-    };
-    xhr.onerror = () => reject(new Error("Network error during upload"));
-    xhr.send(fd);
-  });
-}
-
-const jpg = (url: string) => url.replace(/\.[^./]+$/, ".jpg");
-
-export default function Reels({ accounts }: { accounts: Acc[] }) {
+export default function Reels({ accounts: _accounts }: { accounts: Acc[] }) {
   const [lib, setLib] = useState<Lib | null>(null);
   const [reels, setReels] = useState<Reel[] | null>(null);
 
-  // shared caption + cover
   const [caption, setCaption] = useState<string | null>(null);
   const [cover, setCover] = useState<File | null>(null);
   const [cKey, setCKey] = useState(0);
   const [cStatus, setCStatus] = useState("");
   const [cError, setCError] = useState("");
   const [cBusy, setCBusy] = useState(false);
-
-  // video upload
-  const [files, setFiles] = useState<File[]>([]);
-  const [fKey, setFKey] = useState(0);
-  const [status, setStatus] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
 
   const [testCount, setTestCount] = useState(1);
 
@@ -97,28 +57,37 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
   useEffect(() => {
     loadLib();
     loadReels();
-    const t = setInterval(loadReels, 20_000);
-    return () => clearInterval(t);
+    const t1 = setInterval(loadReels, 20_000);
+    const t2 = setInterval(loadLib, 10_000);
+    return () => {
+      clearInterval(t1);
+      clearInterval(t2);
+    };
   }, [loadLib, loadReels]);
 
   async function saveSettings(e: FormEvent) {
     e.preventDefault();
     setCError("");
-    if (cover && cover.size > MAX_COVER) return setCError("Cover image must be under 8 MB");
+    setCStatus("");
+    if (cover && cover.type !== "image/jpeg") return setCError("Cover JPG hona chahiye");
+    if (cover && cover.size > MAX_COVER) return setCError("Cover 5 MB se chhota hona chahiye");
     setCBusy(true);
     try {
-      let c: Uploaded | null = null;
       if (cover) {
-        const sig = await api<Sig>("/api/reels/upload-signature");
-        c = await uploadFile(cover, "image", sig, (p) => setCStatus(`Uploading cover ${p}%`));
+        const res = await fetch("/api/reels/library/cover", {
+          method: "PUT",
+          headers: { "Content-Type": "image/jpeg" },
+          credentials: "same-origin",
+          body: cover,
+        });
+        if (!res.ok) {
+          const d = await res.json().catch(() => ({}));
+          throw new Error((d as { error?: string }).error ?? "Cover upload failed");
+        }
       }
       await api("/api/reels/library/settings", {
         method: "PUT",
-        body: JSON.stringify({
-          caption: caption ?? lib?.caption ?? "",
-          coverUrl: c?.url ?? null,
-          coverPublicId: c?.publicId ?? null,
-        }),
+        body: JSON.stringify({ caption: caption ?? lib?.caption ?? "" }),
       });
       setCover(null);
       setCKey((k) => k + 1);
@@ -126,44 +95,8 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
       loadLib();
     } catch (err) {
       setCError((err as Error).message);
-      setCStatus("");
     } finally {
       setCBusy(false);
-    }
-  }
-
-  async function addVideos(e: FormEvent) {
-    e.preventDefault();
-    setError("");
-    if (!lib) return;
-    if (files.length === 0) return setError("Please choose videos");
-    if (files.some((f) => f.size > MAX_VIDEO)) return setError("Each video must be under 100 MB");
-    const max = lib.plan.slots.length * lib.plan.batch;
-    const room = max - lib.items.length;
-    if (files.length > room) return setError(`Only ${room} more video(s) fit. Maximum is ${max}.`);
-
-    setBusy(true);
-    let done = 0;
-    try {
-      for (const f of files) {
-        const sig = await api<Sig>("/api/reels/upload-signature");
-        const v = await uploadFile(f, "video", sig, (p) =>
-          setStatus(`Video ${done + 1} of ${files.length}: uploading ${p}%`)
-        );
-        await api("/api/reels/library", {
-          method: "POST",
-          body: JSON.stringify({ videoUrl: v.url, videoPublicId: v.publicId }),
-        });
-        done++;
-        loadLib();
-      }
-      setFiles([]);
-      setFKey((k) => k + 1);
-    } catch (err) {
-      setError(`${(err as Error).message} (${done} of ${files.length} added. Choose only the remaining videos again.)`);
-    } finally {
-      setBusy(false);
-      setStatus("");
     }
   }
 
@@ -178,8 +111,7 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
   }
 
   async function resetAll() {
-    if (!window.confirm("Sab delete ho jayega: saare videos, cover, caption, posts aur Cloudinary storage. Continue?")) return;
-    if (!window.confirm("Pakka? Ye wapas nahi aayega.")) return;
+    if (!window.confirm("Library, caption, cover aur saari posts delete ho jayengi. Continue?")) return;
     try {
       await api("/api/reels/library/reset", { method: "POST" });
       setCaption(null);
@@ -215,6 +147,7 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
   }
 
   const max = lib ? lib.plan.slots.length * lib.plan.batch : 0;
+  const tgl = lib?.telegram;
 
   return (
     <section>
@@ -228,12 +161,27 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
         <p className="muted">Loading...</p>
       )}
 
-      <h2>Caption and Cover (sabke liye ek)</h2>
+      <h2>Telegram (videos yahan se aayengi)</h2>
+      {tgl && !tgl.enabled && <p className="msg bad">Koyeb mein TELEGRAM_BOT_TOKEN set nahi hai.</p>}
+      {tgl && tgl.enabled && (
+        <>
+          <p className="muted">
+            {tgl.linked ? "Telegram linked. Videos bot ko bhejte jao (max 20 MB each)." : "Link karne ke liye:"}
+          </p>
+          {!tgl.linked && (
+            <p className="muted">
+              1) Telegram mein @{tgl.bot ?? "apna bot"} kholo. 2) Ye message bhejo: <b>/start {tgl.code}</b> 3) Phir videos bhejo.
+            </p>
+          )}
+        </>
+      )}
+
+      <h2>Cover and Caption (sabke liye ek)</h2>
       <form className="form" onSubmit={saveSettings} key={`c${cKey}`}>
         {lib?.coverUrl && <img className="thumb" src={lib.coverUrl} alt="" />}
         <label className="field">
-          Cover image (JPG/PNG, naya chunoge to purana replace hoga)
-          <input type="file" accept="image/jpeg,image/png" onChange={(e) => setCover(e.target.files?.[0] ?? null)} />
+          Cover image (sirf JPG, 9:16 best, naya chunoge to purana replace hoga)
+          <input type="file" accept="image/jpeg" onChange={(e) => setCover(e.target.files?.[0] ?? null)} />
         </label>
         <textarea
           placeholder="Caption"
@@ -248,31 +196,16 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
       </form>
 
       <h2>Videos ({lib?.items.length ?? 0} / {max})</h2>
-      <form className="form" onSubmit={addVideos} key={`f${fKey}`}>
-        <label className="field">
-          Videos (select many, MP4/MOV, max 100 MB each)
-          <input
-            type="file"
-            multiple
-            accept="video/mp4,video/quicktime"
-            onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
-          />
-        </label>
-        {files.length > 0 && <p className="muted">{files.length} video(s) selected</p>}
-        {error && <p className="msg bad">{error}</p>}
-        {status && <p className="msg good">{status}</p>}
-        <button className="btn" disabled={busy}>{busy ? "Uploading... keep this page open" : "Add videos"}</button>
-      </form>
-
+      {lib && lib.items.length === 0 && <p className="muted">Abhi koi video nahi. Telegram bot ko videos bhejo.</p>}
       {lib && lib.items.length > 0 && (
         <ul className="status">
           {lib.items.map((v, i) => (
             <li key={v.id} className="reel">
-              <img className="thumb" src={jpg(v.video_url)} alt="" />
               <div className="info">
                 <b>Video {i + 1}</b>
                 <small>
                   Slot {lib.plan.slots[Math.floor(i / lib.plan.batch)] ?? "-"}
+                  {v.tg_size ? ` · ${(v.tg_size / 1048576).toFixed(1)} MB` : ""}
                 </small>
               </div>
               <button type="button" className="link" onClick={() => removeVideo(v.id)}>Remove</button>
@@ -303,7 +236,7 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
         <ul className="status">
           {reels.map((r) => (
             <li key={r.id} className="reel">
-              <img className="thumb" src={r.cover_url ?? jpg(r.video_url)} alt="" />
+              {r.cover_url ? <img className="thumb" src={r.cover_url} alt="" /> : <div className="thumb" />}
               <div className="info">
                 <b>@{r.username}</b>
                 <small>{new Date(r.scheduled_at).toLocaleString()}</small>
@@ -320,7 +253,7 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
 
       <h2>Danger zone</h2>
       <button type="button" className="btn" style={{ background: "#dc2626" }} onClick={resetAll}>
-        Delete everything (videos, posts, storage)
+        Delete library and posts
       </button>
     </section>
   );
