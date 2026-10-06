@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
+import Reels from "./Reels";
 
 type User = { id: string; email: string };
 type Account = {
@@ -127,6 +128,7 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
         </ul>
       )}
       <a className="btn" href="/api/instagram/connect">Connect Instagram account</a>
+      {accounts && accounts.length > 0 && <Reels accounts={accounts} />}
     </main>
   );
 }
