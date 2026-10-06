@@ -4,6 +4,56 @@ import { decryptToken } from "./security";
 const GRAPH = "https://graph.instagram.com/v21.0";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// ---- Queue settings (change in Koyeb env vars; defaults below) ----
+const TZ = process.env.POST_TZ || "Asia/Kolkata";
+function toMinutes(value: string | undefined, fallback: string): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((value ?? "").trim()) ?? /^(\d{1,2}):(\d{2})$/.exec(fallback)!;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+const START = toMinutes(process.env.POST_START_TIME, "00:00");
+const END = toMinutes(process.env.POST_END_TIME, "21:00");
+const INTERVAL = Math.max(1, Math.round((Number(process.env.POST_INTERVAL_HOURS) || 3) * 60));
+const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 1));
+const GRACE_MIN = 30; // a missed slot is still run if the server was down for less than this
+
+function localNow(): { date: string; minutes: number } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+  const get = (t: string) => parts.find((p) => p.type === t)!.value;
+  return { date: `${get("year")}-${get("month")}-${get("day")}`, minutes: Number(get("hour")) * 60 + Number(get("minute")) };
+}
+
+async function promoteQueue() {
+  const { date, minutes } = localNow();
+  if (minutes < START) return;
+  const slot = START + Math.floor((Math.min(minutes, END) - START) / INTERVAL) * INTERVAL;
+  if (minutes - slot > GRACE_MIN) return;
+
+  const key = `${date} ${String(Math.floor(slot / 60)).padStart(2, "0")}:${String(slot % 60).padStart(2, "0")}`;
+  const claimed = await pool.query("INSERT INTO queue_runs (slot_key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING slot_key", [key]);
+  if (!claimed.rows[0]) return;
+
+  const moved = await pool.query(
+    `WITH ranked AS (
+       SELECT id, row_number() OVER (PARTITION BY instagram_account_id ORDER BY created_at, id) AS rn
+       FROM reels WHERE status = 'queued'
+     )
+     UPDATE reels SET status = 'scheduled', scheduled_at = now()
+     WHERE id IN (SELECT id FROM ranked WHERE rn <= $1)`,
+    [BATCH]
+  );
+  console.log(`Queue slot ${key}: released ${moved.rowCount ?? 0} reel(s)`);
+  await pool.query("DELETE FROM queue_runs WHERE ran_at < now() - interval '30 days'");
+}
+
+// ---- Publishing ----
 type Job = {
   id: string;
   video_url: string;
@@ -37,7 +87,6 @@ async function publishOne(job: Job): Promise<void> {
   }
   const token = decryptToken(job.access_token_encrypted);
 
-  // 1. Create the reel container
   const params: Record<string, string> = {
     media_type: "REELS",
     video_url: job.video_url,
@@ -49,7 +98,6 @@ async function publishOne(job: Job): Promise<void> {
   const container = await post<{ id: string }>(`${job.instagram_user_id}/media`, params);
   await pool.query("UPDATE reels SET ig_container_id = $1 WHERE id = $2", [container.id, job.id]);
 
-  // 2. Wait until Instagram finishes processing the video (max ~10 min)
   let ready = false;
   for (let i = 0; i < 120; i++) {
     await sleep(5000);
@@ -66,7 +114,6 @@ async function publishOne(job: Job): Promise<void> {
   }
   if (!ready) throw new Error("Instagram took too long to process the video");
 
-  // 3. Publish
   const pub = await post<{ id: string }>(`${job.instagram_user_id}/media_publish`, {
     creation_id: container.id,
     access_token: token,
@@ -83,11 +130,12 @@ async function tick() {
   if (running) return;
   running = true;
   try {
-    // A reel stuck in "publishing" (server restarted mid-way) is marked failed, never re-posted blindly.
     await pool.query(
       `UPDATE reels SET status = 'failed', error = 'Interrupted while publishing. Check Instagram before retrying.'
        WHERE status = 'publishing' AND updated_at < now() - interval '20 minutes'`
     );
+
+    await promoteQueue();
 
     const { rows } = await pool.query<Job>(
       `WITH due AS (
@@ -120,6 +168,7 @@ async function tick() {
 }
 
 export function startPublisher(): () => void {
+  console.log(`Queue: ${START}-${END} every ${INTERVAL} min, batch ${BATCH}, tz ${TZ}`);
   const timer = setInterval(tick, 30_000);
   setTimeout(tick, 5_000);
   return () => clearInterval(timer);
