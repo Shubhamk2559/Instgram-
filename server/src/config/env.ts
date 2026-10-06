@@ -18,6 +18,9 @@ const schema = z.object({
   INSTAGRAM_APP_ID: z.string().min(1, "INSTAGRAM_APP_ID is required"),
   INSTAGRAM_APP_SECRET: z.string().min(1, "INSTAGRAM_APP_SECRET is required"),
   TOKEN_ENCRYPTION_KEY: z.string().min(32, "TOKEN_ENCRYPTION_KEY must be at least 32 characters"),
+  CLOUDINARY_CLOUD_NAME: z.string().min(1, "CLOUDINARY_CLOUD_NAME is required"),
+  CLOUDINARY_API_KEY: z.string().min(1, "CLOUDINARY_API_KEY is required"),
+  CLOUDINARY_API_SECRET: z.string().min(1, "CLOUDINARY_API_SECRET is required"),
 });
 
 const parsed = schema.safeParse(process.env);
