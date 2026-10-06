@@ -10,7 +10,14 @@ const schema = z.object({
   PORT: z.coerce.number().int().positive().default(8000),
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   DATABASE_SSL: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
-  APP_BASE_URL: z.string().url().default("http://localhost:8000"),
+  APP_BASE_URL: z
+    .string()
+    .url()
+    .default("http://localhost:8000")
+    .transform((v) => v.replace(/\/+$/, "")),
+  INSTAGRAM_APP_ID: z.string().min(1, "INSTAGRAM_APP_ID is required"),
+  INSTAGRAM_APP_SECRET: z.string().min(1, "INSTAGRAM_APP_SECRET is required"),
+  TOKEN_ENCRYPTION_KEY: z.string().min(32, "TOKEN_ENCRYPTION_KEY must be at least 32 characters"),
 });
 
 const parsed = schema.safeParse(process.env);
