@@ -55,12 +55,13 @@ function uploadFile(file: File, kind: "video" | "image", sig: Sig, onProgress: (
   });
 }
 
-// Cloudinary can turn a video URL into a thumbnail by changing the extension.
 const thumb = (r: Reel) => r.cover_url ?? r.video_url.replace(/\.[^./]+$/, ".jpg");
 
 export default function Reels({ accounts }: { accounts: Acc[] }) {
   const [reels, setReels] = useState<Reel[] | null>(null);
   const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
+
+  // single scheduled reel
   const [video, setVideo] = useState<File | null>(null);
   const [cover, setCover] = useState<File | null>(null);
   const [caption, setCaption] = useState("");
@@ -69,6 +70,15 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [formKey, setFormKey] = useState(0);
+
+  // daily queue
+  const [qFiles, setQFiles] = useState<File[]>([]);
+  const [qCover, setQCover] = useState<File | null>(null);
+  const [qCaption, setQCaption] = useState("");
+  const [qStatus, setQStatus] = useState("");
+  const [qError, setQError] = useState("");
+  const [qBusy, setQBusy] = useState(false);
+  const [qKey, setQKey] = useState(0);
 
   const load = useCallback(() => {
     api<{ reels: Reel[] }>("/api/reels")
@@ -125,8 +135,53 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
     }
   }
 
+  async function submitQueue(e: FormEvent) {
+    e.preventDefault();
+    setQError("");
+    if (qFiles.length === 0) return setQError("Please choose one or more videos");
+    if (qFiles.some((f) => f.size > MAX_VIDEO)) return setQError("Each video must be under 100 MB");
+    if (qCover && qCover.size > MAX_COVER) return setQError("Cover image must be under 8 MB");
+
+    setQBusy(true);
+    let done = 0;
+    try {
+      let c: Uploaded | null = null;
+      if (qCover) {
+        const sig = await api<Sig>("/api/reels/upload-signature");
+        c = await uploadFile(qCover, "image", sig, (p) => setQStatus(`Uploading cover ${p}%`));
+      }
+      for (const f of qFiles) {
+        const sig = await api<Sig>("/api/reels/upload-signature");
+        const v = await uploadFile(f, "video", sig, (p) =>
+          setQStatus(`Video ${done + 1} of ${qFiles.length}: uploading ${p}%`)
+        );
+        await api("/api/reels/queue", {
+          method: "POST",
+          body: JSON.stringify({
+            instagramAccountId: accountId,
+            videoUrl: v.url,
+            videoPublicId: v.publicId,
+            coverUrl: c?.url ?? null,
+            coverPublicId: c?.publicId ?? null,
+            caption: qCaption,
+          }),
+        });
+        done++;
+        load();
+      }
+      setQFiles([]);
+      setQCover(null);
+      setQKey((k) => k + 1);
+    } catch (err) {
+      setQError(`${(err as Error).message} (${done} of ${qFiles.length} added to queue)`);
+    } finally {
+      setQBusy(false);
+      setQStatus("");
+    }
+  }
+
   async function remove(id: string) {
-    if (!window.confirm("Delete this scheduled reel?")) return;
+    if (!window.confirm("Delete this reel?")) return;
     try {
       await api(`/api/reels/${id}`, { method: "DELETE" });
     } catch (err) {
@@ -135,9 +190,46 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
     load();
   }
 
+  const queuedCount = reels?.filter((r) => r.status === "queued").length ?? 0;
+
   return (
     <section>
-      <h2>Schedule a Reel</h2>
+      <h2>Daily Queue</h2>
+      <p className="muted">Add many videos once. They post automatically at the daily slots, one after another.</p>
+      <form className="form" onSubmit={submitQueue} key={`q${qKey}`}>
+        <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+          {accounts.map((a) => (
+            <option key={a.id} value={a.id}>@{a.username}</option>
+          ))}
+        </select>
+        <label className="field">
+          Videos (select many, MP4/MOV, max 100 MB each)
+          <input
+            type="file"
+            multiple
+            accept="video/mp4,video/quicktime"
+            onChange={(e) => setQFiles(Array.from(e.target.files ?? []))}
+          />
+        </label>
+        {qFiles.length > 0 && <p className="muted">{qFiles.length} video(s) selected</p>}
+        <label className="field">
+          Cover image for all (optional, JPG/PNG)
+          <input type="file" accept="image/jpeg,image/png" onChange={(e) => setQCover(e.target.files?.[0] ?? null)} />
+        </label>
+        <textarea
+          placeholder="Caption for all"
+          rows={4}
+          maxLength={2200}
+          value={qCaption}
+          onChange={(e) => setQCaption(e.target.value)}
+        />
+        {qError && <p className="msg bad">{qError}</p>}
+        {qStatus && <p className="msg good">{qStatus}</p>}
+        <button className="btn" disabled={qBusy}>{qBusy ? "Uploading... keep this page open" : "Add to Queue"}</button>
+      </form>
+      <p className="muted">In queue: {queuedCount}</p>
+
+      <h2>Schedule one Reel</h2>
       <form className="form" onSubmit={submit} key={formKey}>
         <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
           {accounts.map((a) => (
@@ -172,7 +264,7 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
       {reels === null ? (
         <p className="muted">Loading...</p>
       ) : reels.length === 0 ? (
-        <p className="muted">No reels scheduled yet.</p>
+        <p className="muted">No reels yet.</p>
       ) : (
         <ul className="status">
           {reels.map((r) => (
@@ -180,12 +272,12 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
               <img className="thumb" src={thumb(r)} alt="" />
               <div className="info">
                 <b>@{r.username}</b>
-                <small>{new Date(r.scheduled_at).toLocaleString()}</small>
+                <small>{r.status === "queued" ? "Waiting in queue" : new Date(r.scheduled_at).toLocaleString()}</small>
                 <small className="cap">{r.caption || "(no caption)"}</small>
                 <span className={`badge ${r.status}`}>{r.status}</span>
                 {r.error && <small className="bad">{r.error}</small>}
               </div>
-              {(r.status === "scheduled" || r.status === "failed") && (
+              {(r.status === "queued" || r.status === "scheduled" || r.status === "failed") && (
                 <button type="button" className="link" onClick={() => remove(r.id)}>Delete</button>
               )}
             </li>
