@@ -1,5 +1,7 @@
+import { env } from "../config/env";
 import { pool } from "../db/pool";
 import { decryptToken } from "./security";
+import { downloadTelegramFile, startTelegram } from "./telegram";
 
 const GRAPH = "https://graph.instagram.com/v21.0";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -12,13 +14,12 @@ function toMinutes(value: string | undefined, fallback: string): number {
 }
 const label = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 
-// 09:00, 14:00, 17:00, 19:00, 21:00
 const SLOTS = (process.env.POST_SLOTS || "09:00,14:00,17:00,19:00,21:00")
   .split(",")
   .map((s) => toMinutes(s, "09:00"))
   .sort((a, b) => a - b);
 const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 10));
-const GRACE_MIN = 60; // a missed slot still runs if the server was down for less than this
+const GRACE_MIN = 60;
 
 export const PLAN = { slots: SLOTS.map(label), batch: BATCH, tz: TZ };
 
@@ -43,13 +44,15 @@ export async function release(from: number, to: number, userId: string | null): 
        SELECT l.*, row_number() OVER (PARTITION BY l.user_id ORDER BY l.created_at, l.id) - 1 AS pos
        FROM library l
      )
-     INSERT INTO reels (user_id, instagram_account_id, video_url, video_public_id, cover_url, caption, status, scheduled_at)
-     SELECT k.user_id, a.id, k.video_url, k.video_public_id, s.cover_url, COALESCE(s.caption, ''), 'scheduled', now()
+     INSERT INTO reels (user_id, instagram_account_id, video_url, video_public_id, tg_file_id, cover_url, caption, status, scheduled_at)
+     SELECT k.user_id, a.id, k.video_url, k.video_public_id, k.tg_file_id,
+            CASE WHEN s.cover_token IS NOT NULL THEN $4::text || s.cover_token || '.jpg' END,
+            COALESCE(s.caption, ''), 'scheduled', now()
      FROM ranked k
      JOIN instagram_accounts a ON a.user_id = k.user_id AND a.status = 'active'
      LEFT JOIN queue_settings s ON s.user_id = k.user_id
      WHERE k.pos >= $1 AND k.pos < $2 AND ($3::uuid IS NULL OR k.user_id = $3::uuid)`,
-    [from, to, userId]
+    [from, to, userId, `${env.APP_BASE_URL}/api/public/cover/`]
   );
   return r.rowCount ?? 0;
 }
@@ -71,8 +74,7 @@ async function promoteSlots() {
 
     await pool.query("DELETE FROM queue_runs WHERE ran_at < now() - interval '30 days'");
     await pool.query(
-      `DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '3 days'
-       AND video_public_id IN (SELECT video_public_id FROM library)`
+      "DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '7 days'"
     );
   }
 }
@@ -80,7 +82,8 @@ async function promoteSlots() {
 // ---- Publishing ----
 type Job = {
   id: string;
-  video_url: string;
+  video_url: string | null;
+  tg_file_id: string | null;
   cover_url: string | null;
   caption: string;
   instagram_user_id: string;
@@ -104,6 +107,44 @@ function post<T>(path: string, params: Record<string, string>): Promise<T> {
   });
 }
 
+// Video comes from Telegram: download it, then push the bytes straight to Instagram (resumable upload).
+async function createFromTelegram(job: Job, token: string): Promise<string> {
+  const bytes = await downloadTelegramFile(job.tg_file_id!);
+  const params: Record<string, string> = {
+    media_type: "REELS",
+    upload_type: "resumable",
+    caption: job.caption,
+    share_to_feed: "true",
+    access_token: token,
+  };
+  if (job.cover_url) params.cover_url = job.cover_url;
+  const container = await post<{ id: string; uri?: string }>(`${job.instagram_user_id}/media`, params);
+
+  const up = await fetch(container.uri ?? `https://rupload.facebook.com/ig-api-upload/v21.0/${container.id}`, {
+    method: "POST",
+    headers: { Authorization: `OAuth ${token}`, offset: "0", file_size: String(bytes.length) },
+    body: bytes as unknown as BodyInit,
+  });
+  const d = (await up.json().catch(() => ({}))) as {
+    debug_info?: { message?: string };
+    error?: { message?: string };
+  };
+  if (!up.ok) throw new Error(`Instagram upload failed: ${d.debug_info?.message ?? d.error?.message ?? up.status}`);
+  return container.id;
+}
+
+async function createFromUrl(job: Job, token: string): Promise<string> {
+  const params: Record<string, string> = {
+    media_type: "REELS",
+    video_url: job.video_url!,
+    caption: job.caption,
+    share_to_feed: "true",
+    access_token: token,
+  };
+  if (job.cover_url) params.cover_url = job.cover_url;
+  return (await post<{ id: string }>(`${job.instagram_user_id}/media`, params)).id;
+}
+
 async function publishOne(job: Job): Promise<void> {
   if (job.account_status !== "active") throw new Error("Instagram account is not active. Reconnect it.");
   if (job.token_expires_at && new Date(job.token_expires_at).getTime() < Date.now()) {
@@ -111,22 +152,14 @@ async function publishOne(job: Job): Promise<void> {
   }
   const token = decryptToken(job.access_token_encrypted);
 
-  const params: Record<string, string> = {
-    media_type: "REELS",
-    video_url: job.video_url,
-    caption: job.caption,
-    share_to_feed: "true",
-    access_token: token,
-  };
-  if (job.cover_url) params.cover_url = job.cover_url;
-  const container = await post<{ id: string }>(`${job.instagram_user_id}/media`, params);
-  await pool.query("UPDATE reels SET ig_container_id = $1 WHERE id = $2", [container.id, job.id]);
+  const containerId = job.tg_file_id ? await createFromTelegram(job, token) : await createFromUrl(job, token);
+  await pool.query("UPDATE reels SET ig_container_id = $1 WHERE id = $2", [containerId, job.id]);
 
   let ready = false;
   for (let i = 0; i < 120; i++) {
     await sleep(5000);
     const s = await ig<{ status_code?: string; status?: string }>(
-      `${GRAPH}/${container.id}?fields=status_code,status&access_token=${encodeURIComponent(token)}`
+      `${GRAPH}/${containerId}?fields=status_code,status&access_token=${encodeURIComponent(token)}`
     );
     if (s.status_code === "FINISHED") {
       ready = true;
@@ -139,7 +172,7 @@ async function publishOne(job: Job): Promise<void> {
   if (!ready) throw new Error("Instagram took too long to process the video");
 
   const pub = await post<{ id: string }>(`${job.instagram_user_id}/media_publish`, {
-    creation_id: container.id,
+    creation_id: containerId,
     access_token: token,
   });
   await pool.query(
@@ -169,7 +202,7 @@ async function tick() {
          UPDATE reels r SET status = 'publishing', attempts = r.attempts + 1, error = NULL
          FROM due WHERE r.id = due.id RETURNING r.*
        )
-       SELECT upd.id, upd.video_url, upd.cover_url, upd.caption,
+       SELECT upd.id, upd.video_url, upd.tg_file_id, upd.cover_url, upd.caption,
               a.instagram_user_id, a.access_token_encrypted, a.token_expires_at, a.status AS account_status
        FROM upd JOIN instagram_accounts a ON a.id = upd.instagram_account_id`
     );
@@ -195,6 +228,7 @@ async function tick() {
 
 export function startPublisher(): () => void {
   console.log(`Plan: ${PLAN.slots.join(", ")} | ${BATCH} per account per slot | tz ${TZ}`);
+  startTelegram(() => SLOTS.length * BATCH);
   const timer = setInterval(tick, 30_000);
   setTimeout(tick, 5_000);
   return () => clearInterval(timer);
