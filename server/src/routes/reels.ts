@@ -105,6 +105,18 @@ reelsRouter.post(
   })
 );
 
+// Release every queued reel right now (skips the daily slots).
+reelsRouter.post(
+  "/queue/publish-now",
+  wrap(async (req, res) => {
+    const r = await pool.query(
+      "UPDATE reels SET status = 'scheduled', scheduled_at = now() WHERE user_id = $1 AND status = 'queued'",
+      [req.user!.id]
+    );
+    res.json({ released: r.rowCount ?? 0 });
+  })
+);
+
 reelsRouter.get(
   "/",
   wrap(async (req, res) => {
