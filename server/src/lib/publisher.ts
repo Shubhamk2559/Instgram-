@@ -1,7 +1,7 @@
 import { env } from "../config/env";
 import { pool } from "../db/pool";
-import { decryptToken } from "./security";
-import { downloadTelegramFile, startTelegram } from "./telegram";
+import { decryptToken, sha256 } from "./security";
+import { startTelegram } from "./telegram";
 
 const GRAPH = "https://graph.instagram.com/v21.0";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -107,30 +107,18 @@ function post<T>(path: string, params: Record<string, string>): Promise<T> {
   });
 }
 
-// Video comes from Telegram: download it, then push the bytes straight to Instagram (resumable upload).
+// Video lives in Telegram. Instagram fetches it from our own public link, which proxies Telegram.
 async function createFromTelegram(job: Job, token: string): Promise<string> {
-  const bytes = await downloadTelegramFile(job.tg_file_id!);
+  const sig = sha256(`video:${job.id}:${env.TOKEN_ENCRYPTION_KEY}`).slice(0, 32);
   const params: Record<string, string> = {
     media_type: "REELS",
-    upload_type: "resumable",
+    video_url: `${env.APP_BASE_URL}/api/public/video/${job.id}/${sig}.mp4`,
     caption: job.caption,
     share_to_feed: "true",
     access_token: token,
   };
   if (job.cover_url) params.cover_url = job.cover_url;
-  const container = await post<{ id: string; uri?: string }>(`${job.instagram_user_id}/media`, params);
-
-  const up = await fetch(container.uri ?? `https://rupload.facebook.com/ig-api-upload/v21.0/${container.id}`, {
-    method: "POST",
-    headers: { Authorization: `OAuth ${token}`, offset: "0", file_size: String(bytes.length) },
-    body: bytes as unknown as BodyInit,
-  });
-  const d = (await up.json().catch(() => ({}))) as {
-    debug_info?: { message?: string };
-    error?: { message?: string };
-  };
-  if (!up.ok) throw new Error(`Instagram upload failed: ${d.debug_info?.message ?? d.error?.message ?? up.status}`);
-  return container.id;
+  return (await post<{ id: string }>(`${job.instagram_user_id}/media`, params)).id;
 }
 
 async function createFromUrl(job: Job, token: string): Promise<string> {
