@@ -21,7 +21,7 @@ export function signUpload(folder: string) {
   };
 }
 
-// Best-effort cleanup when a reel is deleted.
+// Best-effort cleanup of one asset.
 export async function destroyAsset(publicId: string, resourceType: "video" | "image"): Promise<void> {
   const timestamp = Math.floor(Date.now() / 1000);
   const body = new URLSearchParams({
@@ -34,4 +34,21 @@ export async function destroyAsset(publicId: string, resourceType: "video" | "im
     method: "POST",
     body,
   }).catch(() => {});
+}
+
+// Deletes EVERYTHING under a folder prefix (videos and images), including leftovers not in the database.
+export async function destroyByPrefix(prefix: string): Promise<void> {
+  const auth = Buffer.from(`${env.CLOUDINARY_API_KEY}:${env.CLOUDINARY_API_SECRET}`).toString("base64");
+  for (const type of ["video", "image"] as const) {
+    for (let i = 0; i < 10; i++) {
+      const url = `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/resources/${type}/upload?prefix=${encodeURIComponent(prefix)}`;
+      const r = await fetch(url, { method: "DELETE", headers: { Authorization: `Basic ${auth}` } }).catch(() => null);
+      if (!r || !r.ok) {
+        console.error(`Cloudinary prefix delete (${type}) failed:`, r?.status);
+        break;
+      }
+      const d = (await r.json().catch(() => ({}))) as { partial?: boolean };
+      if (!d.partial) break;
+    }
+  }
 }
