@@ -3,6 +3,8 @@ import fs from "fs";
 import express, { NextFunction, Request, Response } from "express";
 import helmet from "helmet";
 import { healthRouter } from "./routes/health";
+import { authRouter, originGuard } from "./routes/auth";
+import { instagramRouter } from "./routes/instagram";
 
 export function createApp() {
   const app = express();
@@ -11,7 +13,10 @@ export function createApp() {
   app.use(helmet());
   app.use(express.json({ limit: "1mb" }));
 
+  app.use("/api", originGuard);
   app.use("/api", healthRouter);
+  app.use("/api/auth", authRouter);
+  app.use("/api/instagram", instagramRouter);
   app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
   // Serve the built frontend (same origin as the API).
