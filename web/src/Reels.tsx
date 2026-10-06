@@ -180,6 +180,19 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
     }
   }
 
+  const queuedCount = reels?.filter((r) => r.status === "queued").length ?? 0;
+
+  async function publishAll() {
+    if (!window.confirm(`${queuedCount} reels abhi publish hongi. Continue?`)) return;
+    try {
+      const d = await api<{ released: number }>("/api/reels/queue/publish-now", { method: "POST" });
+      window.alert(`${d.released} reel(s) publish hone lagi`);
+    } catch (err) {
+      window.alert((err as Error).message);
+    }
+    load();
+  }
+
   async function remove(id: string) {
     if (!window.confirm("Delete this reel?")) return;
     try {
@@ -189,8 +202,6 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
     }
     load();
   }
-
-  const queuedCount = reels?.filter((r) => r.status === "queued").length ?? 0;
 
   return (
     <section>
@@ -228,6 +239,11 @@ export default function Reels({ accounts }: { accounts: Acc[] }) {
         <button className="btn" disabled={qBusy}>{qBusy ? "Uploading... keep this page open" : "Add to Queue"}</button>
       </form>
       <p className="muted">In queue: {queuedCount}</p>
+      {queuedCount > 0 && (
+        <button type="button" className="btn" onClick={publishAll}>
+          Publish all now ({queuedCount})
+        </button>
+      )}
 
       <h2>Schedule one Reel</h2>
       <form className="form" onSubmit={submit} key={formKey}>
