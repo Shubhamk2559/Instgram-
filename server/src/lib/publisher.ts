@@ -4,17 +4,23 @@ import { decryptToken } from "./security";
 const GRAPH = "https://graph.instagram.com/v21.0";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// ---- Queue settings (change in Koyeb env vars; defaults below) ----
+// ---- Daily plan (change in Koyeb env vars; defaults below) ----
 const TZ = process.env.POST_TZ || "Asia/Kolkata";
 function toMinutes(value: string | undefined, fallback: string): number {
   const m = /^(\d{1,2}):(\d{2})$/.exec((value ?? "").trim()) ?? /^(\d{1,2}):(\d{2})$/.exec(fallback)!;
   return Number(m[1]) * 60 + Number(m[2]);
 }
-const START = toMinutes(process.env.POST_START_TIME, "00:00");
-const END = toMinutes(process.env.POST_END_TIME, "21:00");
-const INTERVAL = Math.max(1, Math.round((Number(process.env.POST_INTERVAL_HOURS) || 3) * 60));
-const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 1));
-const GRACE_MIN = 30; // a missed slot is still run if the server was down for less than this
+const label = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+
+// 09:00, 14:00, 17:00, 19:00, 21:00
+const SLOTS = (process.env.POST_SLOTS || "09:00,14:00,17:00,19:00,21:00")
+  .split(",")
+  .map((s) => toMinutes(s, "09:00"))
+  .sort((a, b) => a - b);
+const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 10));
+const GRACE_MIN = 60; // a missed slot still runs if the server was down for less than this
+
+export const PLAN = { slots: SLOTS.map(label), batch: BATCH, tz: TZ };
 
 function localNow(): { date: string; minutes: number } {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -30,27 +36,45 @@ function localNow(): { date: string; minutes: number } {
   return { date: `${get("year")}-${get("month")}-${get("day")}`, minutes: Number(get("hour")) * 60 + Number(get("minute")) };
 }
 
-async function promoteQueue() {
-  const { date, minutes } = localNow();
-  if (minutes < START) return;
-  const slot = START + Math.floor((Math.min(minutes, END) - START) / INTERVAL) * INTERVAL;
-  if (minutes - slot > GRACE_MIN) return;
-
-  const key = `${date} ${String(Math.floor(slot / 60)).padStart(2, "0")}:${String(slot % 60).padStart(2, "0")}`;
-  const claimed = await pool.query("INSERT INTO queue_runs (slot_key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING slot_key", [key]);
-  if (!claimed.rows[0]) return;
-
-  const moved = await pool.query(
+// Copies library videos [from, to) into posting jobs, one per active Instagram account.
+export async function release(from: number, to: number, userId: string | null): Promise<number> {
+  const r = await pool.query(
     `WITH ranked AS (
-       SELECT id, row_number() OVER (PARTITION BY instagram_account_id ORDER BY created_at, id) AS rn
-       FROM reels WHERE status = 'queued'
+       SELECT l.*, row_number() OVER (PARTITION BY l.user_id ORDER BY l.created_at, l.id) - 1 AS pos
+       FROM library l
      )
-     UPDATE reels SET status = 'scheduled', scheduled_at = now()
-     WHERE id IN (SELECT id FROM ranked WHERE rn <= $1)`,
-    [BATCH]
+     INSERT INTO reels (user_id, instagram_account_id, video_url, video_public_id, cover_url, caption, status, scheduled_at)
+     SELECT k.user_id, a.id, k.video_url, k.video_public_id, s.cover_url, COALESCE(s.caption, ''), 'scheduled', now()
+     FROM ranked k
+     JOIN instagram_accounts a ON a.user_id = k.user_id AND a.status = 'active'
+     LEFT JOIN queue_settings s ON s.user_id = k.user_id
+     WHERE k.pos >= $1 AND k.pos < $2 AND ($3::uuid IS NULL OR k.user_id = $3::uuid)`,
+    [from, to, userId]
   );
-  console.log(`Queue slot ${key}: released ${moved.rowCount ?? 0} reel(s)`);
-  await pool.query("DELETE FROM queue_runs WHERE ran_at < now() - interval '30 days'");
+  return r.rowCount ?? 0;
+}
+
+async function promoteSlots() {
+  const { date, minutes } = localNow();
+  for (let i = 0; i < SLOTS.length; i++) {
+    const s = SLOTS[i];
+    if (minutes < s || minutes - s > GRACE_MIN) continue;
+    const key = `${date} ${label(s)}`;
+    const claimed = await pool.query(
+      "INSERT INTO queue_runs (slot_key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING slot_key",
+      [key]
+    );
+    if (!claimed.rows[0]) continue;
+
+    const n = await release(i * BATCH, (i + 1) * BATCH, null);
+    console.log(`Slot ${key}: created ${n} post(s)`);
+
+    await pool.query("DELETE FROM queue_runs WHERE ran_at < now() - interval '30 days'");
+    await pool.query(
+      `DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '3 days'
+       AND video_public_id IN (SELECT video_public_id FROM library)`
+    );
+  }
 }
 
 // ---- Publishing ----
@@ -135,12 +159,12 @@ async function tick() {
        WHERE status = 'publishing' AND updated_at < now() - interval '20 minutes'`
     );
 
-    await promoteQueue();
+    await promoteSlots();
 
     const { rows } = await pool.query<Job>(
       `WITH due AS (
          SELECT id FROM reels WHERE status = 'scheduled' AND scheduled_at <= now()
-         ORDER BY scheduled_at LIMIT 3 FOR UPDATE SKIP LOCKED
+         ORDER BY scheduled_at, created_at LIMIT 5 FOR UPDATE SKIP LOCKED
        ), upd AS (
          UPDATE reels r SET status = 'publishing', attempts = r.attempts + 1, error = NULL
          FROM due WHERE r.id = due.id RETURNING r.*
@@ -150,16 +174,18 @@ async function tick() {
        FROM upd JOIN instagram_accounts a ON a.id = upd.instagram_account_id`
     );
 
-    for (const job of rows) {
-      try {
-        await publishOne(job);
-        console.log(`Published reel ${job.id}`);
-      } catch (err) {
-        const msg = (err as Error).message.slice(0, 500);
-        console.error(`Reel ${job.id} failed:`, msg);
-        await pool.query("UPDATE reels SET status = 'failed', error = $1 WHERE id = $2", [msg, job.id]);
-      }
-    }
+    await Promise.all(
+      rows.map(async (job) => {
+        try {
+          await publishOne(job);
+          console.log(`Published reel ${job.id}`);
+        } catch (err) {
+          const msg = (err as Error).message.slice(0, 500);
+          console.error(`Reel ${job.id} failed:`, msg);
+          await pool.query("UPDATE reels SET status = 'failed', error = $1 WHERE id = $2", [msg, job.id]);
+        }
+      })
+    );
   } catch (err) {
     console.error("Publisher tick error:", err);
   } finally {
@@ -168,7 +194,7 @@ async function tick() {
 }
 
 export function startPublisher(): () => void {
-  console.log(`Queue: ${START}-${END} every ${INTERVAL} min, batch ${BATCH}, tz ${TZ}`);
+  console.log(`Plan: ${PLAN.slots.join(", ")} | ${BATCH} per account per slot | tz ${TZ}`);
   const timer = setInterval(tick, 30_000);
   setTimeout(tick, 5_000);
   return () => clearInterval(timer);
