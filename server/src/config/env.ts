@@ -1,0 +1,25 @@
+import path from "path";
+import dotenv from "dotenv";
+import { z } from "zod";
+
+// Load .env from repo root in local dev; in production real env vars are used.
+dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
+
+const schema = z.object({
+  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+  PORT: z.coerce.number().int().positive().default(8000),
+  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  DATABASE_SSL: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  APP_BASE_URL: z.string().url().default("http://localhost:8000"),
+});
+
+const parsed = schema.safeParse(process.env);
+if (!parsed.success) {
+  console.error("Invalid environment configuration:");
+  for (const issue of parsed.error.issues) {
+    console.error(`  - ${issue.path.join(".")}: ${issue.message}`);
+  }
+  process.exit(1);
+}
+
+export const env = parsed.data;
