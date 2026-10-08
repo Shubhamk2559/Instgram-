@@ -6,9 +6,11 @@ type Account = {
   id: string;
   username: string;
   account_type: string | null;
-  status: string;
+  status: "active" | "expired" | "revoked" | string;
   token_expires_at: string | null;
   connected_at: string;
+  last_used_at: string | null;
+  last_error: string | null;
 };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -23,9 +25,17 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 const NOTICES: Record<string, { text: string; ok: boolean }> = {
-  connected: { text: "Instagram account connected.", ok: true },
-  denied: { text: "Instagram connection was cancelled.", ok: false },
+  connected: { text: "Instagram connected. Ab scheduled Reels isi connection se post honge, dobara connect nahi karna.", ok: true },
+  denied: { text: "Instagram authorization was cancelled or permission was denied.", ok: false },
   taken: { text: "That Instagram account is already linked to another user.", ok: false },
+  invalid_state: { text: "This connection attempt expired or was already used. Press Connect Instagram once more.", ok: false },
+  invalid_code: { text: "Instagram rejected the login code (expired or already used). Press Connect Instagram once more.", ok: false },
+  missing_permission: { text: "Instagram permission for publishing was not granted. Please connect again and allow all requested permissions.", ok: false },
+  not_professional: { text: "This Instagram account is not a Professional (Business or Creator) account. Switch it to Professional in Instagram settings first.", ok: false },
+  dev_mode: { text: "Instagram account is not available to this app in the current Development Mode. Add it as an Instagram Tester in Meta and accept the invite in Instagram (Apps and websites > Tester invites).", ok: false },
+  meta_rejected: { text: "Meta rejected this authorization. If the app is in Development Mode, make sure this account is an accepted Instagram Tester.", ok: false },
+  network: { text: "Could not reach Instagram right now. Please try again in a minute.", ok: false },
+  wait: { text: "A connection attempt just started. Please wait a few seconds before trying again.", ok: false },
   error: { text: "Could not connect Instagram. Please try again.", ok: false },
 };
 
@@ -80,6 +90,7 @@ function AuthForm({ onDone }: { onDone: (u: User) => void }) {
 function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [notice, setNotice] = useState<{ text: string; ok: boolean } | null>(null);
+  const [connecting, setConnecting] = useState(false);
 
   const load = useCallback(() => {
     api<{ accounts: Account[] }>("/api/instagram/accounts")
@@ -90,15 +101,28 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
   useEffect(() => {
     load();
     const key = new URLSearchParams(window.location.search).get("instagram");
-    if (key && NOTICES[key]) setNotice(NOTICES[key]);
+    if (key) setNotice(NOTICES[key] ?? NOTICES.error);
     if (key) window.history.replaceState({}, "", "/");
+    // If the browser restores this page from the back button, make the connect button usable again.
+    const reset = () => setConnecting(false);
+    window.addEventListener("pageshow", reset);
+    return () => window.removeEventListener("pageshow", reset);
   }, [load]);
 
   async function disconnect(id: string) {
-    if (!window.confirm("Disconnect this Instagram account?")) return;
+    if (!window.confirm("Disconnect this Instagram account? Its waiting posts will be removed too.")) return;
     await api(`/api/instagram/accounts/${id}`, { method: "DELETE" }).catch(() => {});
     load();
   }
+
+  // One explicit click = one OAuth attempt. The page itself never redirects to Instagram on its own.
+  function startConnect() {
+    if (connecting) return;
+    setConnecting(true);
+    window.location.href = "/api/instagram/connect";
+  }
+
+  const hasAccounts = Boolean(accounts && accounts.length > 0);
 
   return (
     <main className="wrap">
@@ -109,25 +133,45 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
       <p className="muted">{user.email}</p>
       {notice && <p className={`msg ${notice.ok ? "good" : "bad"}`}>{notice.text}</p>}
 
-      <h2>Instagram accounts</h2>
+      <h2>Instagram</h2>
       {accounts === null ? (
         <p className="muted">Loading...</p>
       ) : accounts.length === 0 ? (
-        <p className="muted">No account connected yet.</p>
+        <p className="muted">No account connected yet. Connect once and it stays connected.</p>
       ) : (
         <ul className="status">
-          {accounts.map((a) => (
-            <li key={a.id}>
-              <span>
-                @{a.username}
-                <small> {a.account_type ?? ""} · {a.status}</small>
-              </span>
-              <button className="link" onClick={() => disconnect(a.id)}>Disconnect</button>
-            </li>
-          ))}
+          {accounts.map((a) => {
+            const ok = a.status === "active";
+            return (
+              <li key={a.id}>
+                <span>
+                  @{a.username}
+                  <br />
+                  {ok ? (
+                    <small style={{ color: "#16a34a", opacity: 1 }}>● Connected{a.account_type ? ` · ${a.account_type.toLowerCase()}` : ""}</small>
+                  ) : (
+                    <small className="bad">⚠ Connection {a.status === "revoked" ? "was removed" : "expired"}</small>
+                  )}
+                </span>
+                <span>
+                  {!ok && (
+                    <button className="btn" disabled={connecting} onClick={startConnect}>Reconnect Instagram</button>
+                  )}
+                  <button className="link" onClick={() => disconnect(a.id)}>Disconnect</button>
+                </span>
+              </li>
+            );
+          })}
         </ul>
       )}
-      <a className="btn" href="/api/instagram/connect">Connect Instagram account</a>
+      {accounts && accounts.some((a) => a.status !== "active") && (
+        <p className="msg bad">Posting is paused for accounts that need reconnecting. Waiting posts resume automatically after you reconnect.</p>
+      )}
+      {accounts !== null && (
+        <button className="btn" disabled={connecting} onClick={startConnect}>
+          {connecting ? "Opening Instagram..." : hasAccounts ? "Connect another Instagram account" : "Connect Instagram"}
+        </button>
+      )}
       {accounts && accounts.length > 0 && <Reels accounts={accounts} />}
     </main>
   );
