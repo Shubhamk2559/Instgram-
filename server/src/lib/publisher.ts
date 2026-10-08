@@ -1,9 +1,9 @@
 import { env } from "../config/env";
 import { pool } from "../db/pool";
-import { decryptToken, sha256 } from "./security";
+import { IgError, describeError, igGet, igPost, refreshLongLivedToken } from "./instagram";
+import { decryptToken, encryptToken, sha256 } from "./security";
 import { startTelegram } from "./telegram";
 
-const GRAPH = "https://graph.instagram.com/v21.0";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Daily plan (change in Koyeb env vars; defaults below) ----
@@ -22,6 +22,16 @@ const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 10))
 const GRACE_MIN = 60;
 
 export const PLAN = { slots: SLOTS.map(label), batch: BATCH, tz: TZ };
+
+// ---- Safety limits ----
+const MAX_ATTEMPTS = 3; // container-creation attempts per post (only safe, pre-publish steps are retried)
+const MAX_PARALLEL = 3; // different Instagram accounts processed at once (one post per account at a time)
+const STALE_MINUTES = 10; // an in-flight post with no heartbeat for this long is recovered
+const MISSED_HOURS = 12; // a waiting post older than this is dropped instead of posting very late
+// Meta allows 100 API-published posts per account per rolling 24h. Stay below it.
+const DAILY_CAP = Math.max(1, Math.min(100, Math.floor(Number(process.env.IG_DAILY_POST_CAP) || 90)));
+// Meta recommends checking container status about once a minute for at most ~5 minutes. We start a bit earlier, then slow down.
+const POLL_DELAYS_S = [20, 30, 60, 60, 60, 60, 60, 60, 60, 60];
 
 function localNow(): { date: string; minutes: number } {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -63,159 +73,490 @@ async function promoteSlots() {
     const s = SLOTS[i];
     if (minutes < s || minutes - s > GRACE_MIN) continue;
     const key = `${date} ${label(s)}`;
+    // Atomic claim: only one instance/tick can ever create the posts for a slot.
     const claimed = await pool.query(
       "INSERT INTO queue_runs (slot_key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING slot_key",
       [key]
     );
     if (!claimed.rows[0]) continue;
 
-    const n = await release(i * BATCH, (i + 1) * BATCH, null);
-    console.log(`Slot ${key}: created ${n} post(s)`);
+    try {
+      const n = await release(i * BATCH, (i + 1) * BATCH, null);
+      console.log(`Slot ${key}: created ${n} post(s)`);
+    } catch (err) {
+      // release() is one INSERT statement (all-or-nothing), so un-claiming the slot is safe and lets the next tick retry.
+      console.error(`Slot ${key} failed, will retry:`, describeError(err));
+      await pool.query("DELETE FROM queue_runs WHERE slot_key = $1", [key]).catch(() => {});
+      continue;
+    }
 
     await pool.query("DELETE FROM queue_runs WHERE ran_at < now() - interval '30 days'");
-    await pool.query(
-      "DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '7 days'"
-    );
+    await pool.query("DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '7 days'");
   }
 }
 
-// ---- Publishing ----
+// ---------------------------------------------------------------------------
+// Publishing
+//
+// State machine (a row only moves forward through atomic compare-and-set UPDATEs):
+//
+//   scheduled -> publishing -> container_created -> publish_requested -> published
+//                    |               |                    |
+//                    +---------------+--------------------+--> failed
+//
+// * publishing          : creating the Instagram upload container (nothing public yet -> safe to retry)
+// * container_created   : container exists, waiting for Instagram to finish processing (safe to resume)
+// * publish_requested   : media_publish was SENT. It is NEVER sent a second time for this post.
+// ---------------------------------------------------------------------------
 type Job = {
   id: string;
   video_url: string | null;
   tg_file_id: string | null;
   cover_url: string | null;
   caption: string;
+  ig_container_id: string | null;
+  attempts: number;
+  status: string;
+  account_id: string;
   instagram_user_id: string;
   access_token_encrypted: string;
   token_expires_at: Date | null;
   account_status: string;
 };
 
-async function ig<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, init);
-  const data = (await r.json().catch(() => ({}))) as { error?: { message?: string } } & Record<string, unknown>;
-  if (!r.ok || data.error) throw new Error(data.error?.message ?? `Instagram error ${r.status}`);
-  return data as T;
+const cols = (t: string) =>
+  `${t}.id, ${t}.video_url, ${t}.tg_file_id, ${t}.cover_url, ${t}.caption, ${t}.ig_container_id, ${t}.attempts, ${t}.status,
+   a.id AS account_id, a.instagram_user_id, a.access_token_encrypted, a.token_expires_at, a.status AS account_status`;
+
+// A failure that must not be retried.
+class JobFailure extends Error {}
+
+const backoffSeconds = (attempts: number) => Math.min(30 * 60, 120 * 2 ** Math.max(attempts - 1, 0));
+
+async function setAccountState(accountId: string, status: "expired" | "revoked", reason: string) {
+  // Only flips an ACTIVE account, so a dead token is recorded once instead of being retried forever.
+  await pool.query("UPDATE instagram_accounts SET status = $2, last_error = $3 WHERE id = $1 AND status = 'active'", [
+    accountId,
+    status,
+    reason.slice(0, 400),
+  ]);
 }
 
-function post<T>(path: string, params: Record<string, string>): Promise<T> {
-  return ig<T>(`${GRAPH}/${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(params),
-  });
-}
-
-// Video lives in Telegram. Instagram fetches it from our own public link, which proxies Telegram.
-async function createFromTelegram(job: Job, token: string): Promise<string> {
-  const sig = sha256(`video:${job.id}:${env.TOKEN_ENCRYPTION_KEY}`).slice(0, 32);
-  const params: Record<string, string> = {
-    media_type: "REELS",
-    video_url: `${env.APP_BASE_URL}/api/public/video/${job.id}/${sig}.mp4`,
-    caption: job.caption,
-    share_to_feed: "true",
-    access_token: token,
-  };
-  if (job.cover_url) params.cover_url = job.cover_url;
-  return (await post<{ id: string }>(`${job.instagram_user_id}/media`, params)).id;
-}
-
-async function createFromUrl(job: Job, token: string): Promise<string> {
-  const params: Record<string, string> = {
-    media_type: "REELS",
-    video_url: job.video_url!,
-    caption: job.caption,
-    share_to_feed: "true",
-    access_token: token,
-  };
-  if (job.cover_url) params.cover_url = job.cover_url;
-  return (await post<{ id: string }>(`${job.instagram_user_id}/media`, params)).id;
-}
-
-async function publishOne(job: Job): Promise<void> {
-  if (job.account_status !== "active") throw new Error("Instagram account is not active. Reconnect it.");
-  if (job.token_expires_at && new Date(job.token_expires_at).getTime() < Date.now()) {
-    throw new Error("Instagram token expired. Reconnect the account.");
-  }
-  const token = decryptToken(job.access_token_encrypted);
-
-  const containerId = job.tg_file_id ? await createFromTelegram(job, token) : await createFromUrl(job, token);
-  await pool.query("UPDATE reels SET ig_container_id = $1 WHERE id = $2", [containerId, job.id]);
-
-  let ready = false;
-  for (let i = 0; i < 120; i++) {
-    await sleep(5000);
-    const s = await ig<{ status_code?: string; status?: string }>(
-      `${GRAPH}/${containerId}?fields=status_code,status&access_token=${encodeURIComponent(token)}`
-    );
-    if (s.status_code === "FINISHED") {
-      ready = true;
-      break;
-    }
-    if (s.status_code === "ERROR" || s.status_code === "EXPIRED") {
-      throw new Error(`Instagram could not process the video (${s.status ?? s.status_code})`);
-    }
-  }
-  if (!ready) throw new Error("Instagram took too long to process the video");
-
-  const pub = await post<{ id: string }>(`${job.instagram_user_id}/media_publish`, {
-    creation_id: containerId,
-    access_token: token,
-  });
+// Puts a post back in the waiting list. Only valid BEFORE media_publish succeeded or was refused by Meta.
+async function requeue(jobId: string, delaySeconds: number, burnAttempt: boolean, reason: string) {
   await pool.query(
-    "UPDATE reels SET status = 'published', ig_media_id = $1, published_at = now(), error = NULL WHERE id = $2",
-    [pub.id, job.id]
+    `UPDATE reels SET status = 'scheduled', ig_container_id = NULL,
+       scheduled_at = now() + make_interval(secs => $2::int),
+       attempts = GREATEST(attempts - $3::int, 0), error = $4
+     WHERE id = $1 AND status IN ('publishing', 'container_created', 'publish_requested')`,
+    [jobId, delaySeconds, burnAttempt ? 0 : 1, reason.slice(0, 400)]
   );
 }
 
-let running = false;
+async function failJob(jobId: string, message: string) {
+  await pool.query("UPDATE reels SET status = 'failed', error = $2 WHERE id = $1 AND status <> 'published'", [
+    jobId,
+    message.slice(0, 500),
+  ]);
+}
+
+async function markPublished(job: Job, mediaId: string | null) {
+  await pool.query(
+    "UPDATE reels SET status = 'published', ig_media_id = $1, published_at = now(), error = NULL WHERE id = $2",
+    [mediaId, job.id]
+  );
+  await pool.query("UPDATE instagram_accounts SET last_used_at = now(), last_error = NULL WHERE id = $1", [job.account_id]);
+}
+
+// After Instagram throttles an account, push ALL its waiting posts back so we stop calling the API.
+async function pauseAccount(accountId: string, minutes: number) {
+  await pool.query(
+    `UPDATE reels SET scheduled_at = GREATEST(scheduled_at, now() + make_interval(mins => $2::int))
+     WHERE instagram_account_id = $1 AND status = 'scheduled'`,
+    [accountId, minutes]
+  );
+}
+
+async function underDailyCap(accountId: string): Promise<boolean> {
+  const r = await pool.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM reels
+     WHERE instagram_account_id = $1
+       AND ((status = 'published' AND published_at > now() - interval '24 hours')
+            OR status IN ('container_created', 'publish_requested'))`,
+    [accountId]
+  );
+  return r.rows[0].n < DAILY_CAP;
+}
+
+async function createContainer(job: Job, token: string): Promise<string> {
+  const params: Record<string, string> = {
+    media_type: "REELS",
+    caption: job.caption,
+    share_to_feed: "true",
+    access_token: token,
+  };
+  if (job.tg_file_id) {
+    // Video lives in Telegram. Instagram fetches it from our own signed public link, which proxies Telegram.
+    const sig = sha256(`video:${job.id}:${env.TOKEN_ENCRYPTION_KEY}`).slice(0, 32);
+    params.video_url = `${env.APP_BASE_URL}/api/public/video/${job.id}/${sig}.mp4`;
+  } else if (job.video_url) {
+    params.video_url = job.video_url;
+  } else {
+    throw new JobFailure("This post has no video attached.");
+  }
+  if (job.cover_url) params.cover_url = job.cover_url;
+  const r = await igPost<{ id?: string }>(`${job.instagram_user_id}/media`, params);
+  if (!r.id) throw new JobFailure("Instagram did not return an upload id.");
+  return r.id;
+}
+
+// Gentle polling with a heartbeat so other instances know this job is alive.
+async function waitUntilFinished(jobId: string, containerId: string, token: string): Promise<"finished" | "published"> {
+  for (const delay of POLL_DELAYS_S) {
+    await sleep(delay * 1000);
+    await pool.query("UPDATE reels SET updated_at = now() WHERE id = $1", [jobId]);
+    let s: { status_code?: string; status?: string };
+    try {
+      s = await igGet<{ status_code?: string; status?: string }>(containerId, {
+        fields: "status_code,status",
+        access_token: token,
+      });
+    } catch (e) {
+      if (e instanceof IgError && e.kind === "transient") continue; // temporary hiccup: just check again later
+      throw e;
+    }
+    if (s.status_code === "FINISHED") return "finished";
+    if (s.status_code === "PUBLISHED") return "published";
+    if (s.status_code === "ERROR" || s.status_code === "EXPIRED") {
+      throw new JobFailure(`Instagram could not process the video (${s.status ?? s.status_code}).`);
+    }
+  }
+  throw new JobFailure("Instagram took too long to process the video.");
+}
+
+// The outcome of media_publish is unknown (timeout / connection lost / 5xx). Never re-send it: ask Instagram instead.
+// This function never throws and never re-queues: from here a post can only become published or failed.
+async function reconcile(job: Job, containerId: string, token: string, checks: number, gapSeconds: number) {
+  for (let i = 0; i < checks; i++) {
+    if (gapSeconds > 0) await sleep(gapSeconds * 1000);
+    try {
+      const s = await igGet<{ status_code?: string }>(containerId, { fields: "status_code", access_token: token });
+      if (s.status_code === "PUBLISHED") {
+        await markPublished(job, null);
+        return;
+      }
+      if (s.status_code === "ERROR" || s.status_code === "EXPIRED") break;
+    } catch (e) {
+      if (e instanceof IgError && (e.kind === "auth_expired" || e.kind === "auth_revoked")) {
+        await setAccountState(job.account_id, e.kind === "auth_expired" ? "expired" : "revoked", "Instagram connection expired. Please reconnect.").catch(() => {});
+        break;
+      }
+    }
+  }
+  await failJob(
+    job.id,
+    "Instagram did not confirm this post. It was NOT retried automatically (to avoid a duplicate). Check your Instagram profile."
+  ).catch(() => {});
+}
+
+async function processJob(job: Job): Promise<void> {
+  if (job.account_status !== "active") {
+    await requeue(job.id, 60, false, "Waiting for Instagram reconnect.");
+    return;
+  }
+  if (job.token_expires_at && new Date(job.token_expires_at).getTime() < Date.now()) {
+    await setAccountState(job.account_id, "expired", "Instagram connection expired. Please reconnect.");
+    await requeue(job.id, 60, false, "Waiting for Instagram reconnect.");
+    return;
+  }
+
+  let token: string;
+  try {
+    token = decryptToken(job.access_token_encrypted);
+  } catch {
+    await setAccountState(job.account_id, "revoked", "Saved connection could not be read. Please reconnect Instagram.");
+    await requeue(job.id, 60, false, "Waiting for Instagram reconnect.");
+    return;
+  }
+
+  // 1) Create the upload container (skipped when resuming a post that already has one).
+  let containerId = job.ig_container_id;
+  if (!containerId) {
+    if (!(await underDailyCap(job.account_id))) {
+      await requeue(job.id, 3600, false, "Daily Instagram publishing limit reached; will try again later.");
+      return;
+    }
+    containerId = await createContainer(job, token);
+    const saved = await pool.query(
+      "UPDATE reels SET status = 'container_created', ig_container_id = $1 WHERE id = $2 AND status = 'publishing' RETURNING id",
+      [containerId, job.id]
+    );
+    if (!saved.rows[0]) return; // post changed under us: do nothing, never publish
+  }
+
+  // 2) Wait for Instagram to process the video.
+  const state = await waitUntilFinished(job.id, containerId, token);
+  if (state === "published") {
+    await markPublished(job, null);
+    return;
+  }
+
+  // 3) Atomic hand-off: only ONE worker can move container_created -> publish_requested, so only one can publish.
+  const claim = await pool.query(
+    "UPDATE reels SET status = 'publish_requested' WHERE id = $1 AND status = 'container_created' RETURNING id",
+    [job.id]
+  );
+  if (!claim.rows[0]) return;
+
+  let mediaId: string | null = null;
+  try {
+    const pub = await igPost<{ id?: string }>(
+      `${job.instagram_user_id}/media_publish`,
+      { creation_id: containerId, access_token: token },
+      60_000
+    );
+    mediaId = pub.id ?? null;
+  } catch (err) {
+    if (err instanceof IgError && !err.definitive) {
+      // Unknown outcome: it may have worked. Check, never re-send.
+      await reconcile(job, containerId, token, 3, 20);
+      return;
+    }
+    throw err; // Meta explicitly refused: nothing was published
+  }
+  await markPublished(job, mediaId);
+}
+
+async function handleError(job: Job, err: unknown) {
+  const msg = describeError(err);
+  if (err instanceof JobFailure) return failJob(job.id, msg);
+
+  if (err instanceof IgError) {
+    switch (err.kind) {
+      case "auth_expired":
+      case "auth_revoked": {
+        const expired = err.kind === "auth_expired";
+        console.error(`Account ${job.account_id}: ${expired ? "token expired" : "access revoked"} (${msg})`);
+        await setAccountState(
+          job.account_id,
+          expired ? "expired" : "revoked",
+          expired
+            ? "Instagram connection expired. Please reconnect."
+            : "Instagram access was removed or a permission is missing. Please reconnect."
+        );
+        // Wait for the user to reconnect. No retry loop: waiting posts are skipped while the account is not active.
+        return requeue(job.id, 60, false, "Waiting for Instagram reconnect.");
+      }
+      case "rate_limit":
+        console.error(`Account ${job.account_id}: Instagram rate limit (${msg}). Pausing 30 minutes.`);
+        await pauseAccount(job.account_id, 30);
+        return requeue(job.id, 30 * 60, false, "Instagram rate limit; will try again later.");
+      case "transient":
+        if (job.attempts < MAX_ATTEMPTS) {
+          return requeue(job.id, backoffSeconds(job.attempts), true, `Temporary Instagram problem, retrying: ${msg}`);
+        }
+        return failJob(job.id, msg);
+      default:
+        return failJob(job.id, msg);
+    }
+  }
+  console.error(`Reel ${job.id} unexpected error:`, msg);
+  const cur = await pool.query<{ status: string }>("SELECT status FROM reels WHERE id = $1", [job.id]).catch(() => null);
+  // If media_publish was already sent, leave it for the stale-job reconciler (it may really be published).
+  if (cur?.rows[0]?.status === "publish_requested") return;
+  return failJob(job.id, `Unexpected error: ${msg}`);
+}
+
+let active = 0;
+
+function launch(jobs: Job[], fn: (job: Job) => Promise<void>) {
+  for (const job of jobs) {
+    active++;
+    fn(job)
+      .catch((e) => console.error(`Reel ${job.id} crashed:`, describeError(e)))
+      .finally(() => {
+        active--;
+      });
+  }
+}
+
+async function runJob(job: Job): Promise<void> {
+  try {
+    await processJob(job);
+    const done = await pool.query<{ status: string }>("SELECT status FROM reels WHERE id = $1", [job.id]);
+    if (done.rows[0]?.status === "published") console.log(`Published reel ${job.id}`);
+  } catch (err) {
+    await handleError(job, err);
+  }
+}
+
+// Post whose publish result was never recorded (crash/restart): ask Instagram once, never re-publish.
+async function runReconcile(job: Job): Promise<void> {
+  try {
+    if (!job.ig_container_id) return await failJob(job.id, "Interrupted while publishing. Check your Instagram profile.");
+    await reconcile(job, job.ig_container_id, decryptToken(job.access_token_encrypted), 1, 0);
+  } catch (err) {
+    console.error(`Reel ${job.id} reconcile error:`, describeError(err));
+    await failJob(job.id, "Instagram did not confirm this post. Check your Instagram profile.").catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Housekeeping that runs every tick (database only, no Instagram calls)
+// ---------------------------------------------------------------------------
+async function housekeeping() {
+  await pool.query(
+    `UPDATE instagram_accounts SET status = 'expired', last_error = 'Instagram connection expired. Please reconnect.'
+     WHERE status = 'active' AND token_expires_at IS NOT NULL AND token_expires_at < now()`
+  );
+  await pool.query(
+    `UPDATE reels SET status = 'failed',
+       error = 'Missed: Instagram was not ready in time. This video will post again at its next slot.'
+     WHERE status = 'scheduled' AND scheduled_at < now() - make_interval(hours => $1::int)`,
+    [MISSED_HOURS]
+  );
+}
+
+// Jobs left in-flight by a crash / restart / Koyeb redeploy.
+async function recoverStale() {
+  // a) Interrupted while creating the container: nothing was published, safe to retry (bounded, with backoff).
+  await pool.query(
+    `UPDATE reels SET
+       status = CASE WHEN attempts >= $1::int THEN 'failed' ELSE 'scheduled' END,
+       ig_container_id = NULL,
+       scheduled_at = now() + make_interval(secs => LEAST(1800, 120 * (2 ^ GREATEST(attempts - 1, 0)))::int),
+       error = CASE WHEN attempts >= $1::int THEN 'Interrupted while preparing the upload. Not retried further.'
+                    ELSE 'Interrupted (restart), retrying safely.' END
+     WHERE status = 'publishing' AND updated_at < now() - make_interval(mins => $2::int)`,
+    [MAX_ATTEMPTS, STALE_MINUTES]
+  );
+
+  // b) Container exists but nobody is polling it: give up after too many resumes, otherwise resume (no new container).
+  await pool.query(
+    `UPDATE reels SET status = 'failed', error = 'Instagram processing was interrupted too many times.'
+     WHERE status = 'container_created' AND attempts >= 5 AND updated_at < now() - make_interval(mins => $1::int)`,
+    [STALE_MINUTES]
+  );
+  const resume = await pool.query<Job>(
+    `WITH s AS (
+       SELECT id FROM reels
+       WHERE status = 'container_created' AND attempts < 5 AND updated_at < now() - make_interval(mins => $1::int)
+       ORDER BY updated_at LIMIT 3 FOR UPDATE SKIP LOCKED
+     ), u AS (
+       UPDATE reels r SET updated_at = now(), attempts = r.attempts + 1 FROM s WHERE r.id = s.id RETURNING r.*
+     )
+     SELECT ${cols("u")} FROM u JOIN instagram_accounts a ON a.id = u.instagram_account_id`,
+    [STALE_MINUTES]
+  );
+  launch(resume.rows, runJob);
+
+  // c) media_publish was sent but the result was never saved: check once, NEVER publish again.
+  const recon = await pool.query<Job>(
+    `WITH s AS (
+       SELECT id FROM reels
+       WHERE status = 'publish_requested' AND updated_at < now() - make_interval(mins => $1::int)
+       ORDER BY updated_at LIMIT 3 FOR UPDATE SKIP LOCKED
+     ), u AS (
+       UPDATE reels r SET updated_at = now() FROM s WHERE r.id = s.id RETURNING r.*
+     )
+     SELECT ${cols("u")} FROM u JOIN instagram_accounts a ON a.id = u.instagram_account_id`,
+    [STALE_MINUTES]
+  );
+  launch(recon.rows, runReconcile);
+}
+
+// ---------------------------------------------------------------------------
+// Token renewal: the official refresh endpoint, ~once per 40 days per account.
+// ---------------------------------------------------------------------------
+async function refreshTokens() {
+  const { rows } = await pool.query<{ id: string; access_token_encrypted: string }>(
+    `UPDATE instagram_accounts a SET last_refresh_attempt_at = now()
+     WHERE a.id IN (
+       SELECT id FROM instagram_accounts
+       WHERE status = 'active' AND token_expires_at IS NOT NULL
+         AND token_expires_at > now() AND token_expires_at < now() + interval '20 days'
+         AND COALESCE(token_refreshed_at, connected_at) < now() - interval '25 hours'
+         AND (last_refresh_attempt_at IS NULL OR last_refresh_attempt_at < now() - interval '12 hours')
+       ORDER BY token_expires_at LIMIT 3 FOR UPDATE SKIP LOCKED
+     )
+     RETURNING a.id, a.access_token_encrypted`
+  );
+  for (const a of rows) {
+    try {
+      const fresh = await refreshLongLivedToken(decryptToken(a.access_token_encrypted));
+      await pool.query(
+        `UPDATE instagram_accounts SET access_token_encrypted = $2,
+           token_expires_at = now() + make_interval(secs => $3::int), token_refreshed_at = now(), last_error = NULL
+         WHERE id = $1 AND status = 'active'`,
+        [a.id, encryptToken(fresh.access_token), fresh.expires_in]
+      );
+      console.log(`Renewed Instagram token for account ${a.id}`);
+    } catch (err) {
+      if (err instanceof IgError && (err.kind === "auth_expired" || err.kind === "auth_revoked")) {
+        await setAccountState(
+          a.id,
+          err.kind === "auth_expired" ? "expired" : "revoked",
+          "Instagram connection expired or was revoked. Please reconnect."
+        );
+      } else {
+        // Not retried for 12 hours (see last_refresh_attempt_at): no retry storm.
+        console.error(`Token renewal failed for account ${a.id} (retry in 12h):`, describeError(err));
+      }
+    }
+  }
+}
+
+// Claims at most ONE waiting post per account (and only for accounts with nothing in flight).
+async function claimDue(limit: number): Promise<Job[]> {
+  const { rows } = await pool.query<Job>(
+    `WITH cand AS (
+       SELECT DISTINCT ON (r.instagram_account_id) r.id, r.scheduled_at, r.created_at
+       FROM reels r
+       JOIN instagram_accounts a ON a.id = r.instagram_account_id AND a.status = 'active'
+       WHERE r.status = 'scheduled' AND r.scheduled_at <= now()
+         AND NOT EXISTS (
+           SELECT 1 FROM reels x
+           WHERE x.instagram_account_id = r.instagram_account_id
+             AND x.status IN ('publishing', 'container_created', 'publish_requested')
+         )
+       ORDER BY r.instagram_account_id, r.scheduled_at, r.created_at
+     ), due AS (
+       SELECT r.id FROM reels r JOIN cand ON cand.id = r.id
+       ORDER BY cand.scheduled_at, cand.created_at
+       LIMIT $1
+       FOR UPDATE OF r SKIP LOCKED
+     ), upd AS (
+       UPDATE reels r SET status = 'publishing', attempts = r.attempts + 1, error = NULL
+       FROM due WHERE r.id = due.id AND r.status = 'scheduled'
+       RETURNING r.*
+     )
+     SELECT ${cols("upd")} FROM upd JOIN instagram_accounts a ON a.id = upd.instagram_account_id`,
+    [limit]
+  );
+  return rows;
+}
+
+let ticking = false;
 
 async function tick() {
-  if (running) return;
-  running = true;
+  if (ticking) return;
+  ticking = true;
   try {
-    await pool.query(
-      `UPDATE reels SET status = 'failed', error = 'Interrupted while publishing. Check Instagram before retrying.'
-       WHERE status = 'publishing' AND updated_at < now() - interval '20 minutes'`
-    );
-
+    await housekeeping();
     await promoteSlots();
-
-    const { rows } = await pool.query<Job>(
-      `WITH due AS (
-         SELECT id FROM reels WHERE status = 'scheduled' AND scheduled_at <= now()
-         ORDER BY scheduled_at, created_at LIMIT 5 FOR UPDATE SKIP LOCKED
-       ), upd AS (
-         UPDATE reels r SET status = 'publishing', attempts = r.attempts + 1, error = NULL
-         FROM due WHERE r.id = due.id RETURNING r.*
-       )
-       SELECT upd.id, upd.video_url, upd.tg_file_id, upd.cover_url, upd.caption,
-              a.instagram_user_id, a.access_token_encrypted, a.token_expires_at, a.status AS account_status
-       FROM upd JOIN instagram_accounts a ON a.id = upd.instagram_account_id`
-    );
-
-    await Promise.all(
-      rows.map(async (job) => {
-        try {
-          await publishOne(job);
-          console.log(`Published reel ${job.id}`);
-        } catch (err) {
-          const msg = (err as Error).message.slice(0, 500);
-          console.error(`Reel ${job.id} failed:`, msg);
-          await pool.query("UPDATE reels SET status = 'failed', error = $1 WHERE id = $2", [msg, job.id]);
-        }
-      })
-    );
+    await refreshTokens();
+    await recoverStale();
+    const room = MAX_PARALLEL - active;
+    if (room > 0) launch(await claimDue(room), runJob);
   } catch (err) {
-    console.error("Publisher tick error:", err);
+    console.error("Publisher tick error:", describeError(err));
   } finally {
-    running = false;
+    ticking = false;
   }
 }
 
 export function startPublisher(): () => void {
-  console.log(`Plan: ${PLAN.slots.join(", ")} | ${BATCH} per account per slot | tz ${TZ}`);
+  console.log(`Plan: ${PLAN.slots.join(", ")} | ${BATCH} per account per slot | tz ${TZ} | daily cap ${DAILY_CAP}`);
   startTelegram(() => SLOTS.length * BATCH);
   const timer = setInterval(tick, 30_000);
   setTimeout(tick, 5_000);
