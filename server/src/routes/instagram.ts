@@ -1,136 +1,190 @@
-import { Router } from "express";
+import { Response, Router } from "express";
 import { z } from "zod";
 import { env } from "../config/env";
 import { pool } from "../db/pool";
+import { GRAPH, GRAPH_HOST, IgError, describeError, igFetch, redact } from "../lib/instagram";
 import { encryptToken, newToken, sha256 } from "../lib/security";
 import { requireAuth, wrap } from "./auth";
 
+// Minimum permissions needed to read the account and publish Reels. Nothing else is requested.
 const SCOPES = ["instagram_business_basic", "instagram_business_content_publish"];
+const REQUIRED_PUBLISH_SCOPE = "instagram_business_content_publish";
+// Must match "Valid OAuth Redirect URIs" in Meta (Instagram > API setup with Instagram login > Business login settings) exactly.
 const REDIRECT_URI = `${env.APP_BASE_URL}/api/instagram/callback`;
-
-async function igJson<T>(r: Response): Promise<T> {
-  const data = (await r.json().catch(() => ({}))) as T;
-  if (!r.ok) throw new Error(`Instagram API error ${r.status}: ${JSON.stringify(data)}`);
-  return data;
-}
+const CONNECT_COOLDOWN_SECONDS = 10;
 
 export const instagramRouter = Router();
 instagramRouter.use(requireAuth);
 
-// Step 1: send the user to Instagram's official login screen.
+function back(res: Response, key: string) {
+  res.set("Cache-Control", "no-store");
+  return res.redirect(`/?instagram=${key}`);
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: user clicks "Connect Instagram" -> official Instagram login/consent screen.
+// Happens ONCE per account (and again only if the connection expires/is revoked).
+// ---------------------------------------------------------------------------
 instagramRouter.get(
   "/connect",
   wrap(async (req, res) => {
+    const uid = req.user!.id;
+
+    // Anti-loop: ignore double clicks / prefetch / accidental repeats.
+    const recent = await pool.query(
+      `SELECT 1 FROM oauth_states WHERE user_id = $1 AND created_at > now() - ($2 || ' seconds')::interval LIMIT 1`,
+      [uid, String(CONNECT_COOLDOWN_SECONDS)]
+    );
+    if (recent.rows[0]) return back(res, "wait");
+
     const state = newToken();
     await pool.query("DELETE FROM oauth_states WHERE expires_at < now()");
     await pool.query(
       "INSERT INTO oauth_states (user_id, state_hash, expires_at) VALUES ($1, $2, now() + interval '10 minutes')",
-      [req.user!.id, sha256(state)]
+      [uid, sha256(state)]
     );
+
     const url = new URL("https://www.instagram.com/oauth/authorize");
     url.searchParams.set("client_id", env.INSTAGRAM_APP_ID);
     url.searchParams.set("redirect_uri", REDIRECT_URI);
     url.searchParams.set("response_type", "code");
     url.searchParams.set("scope", SCOPES.join(","));
     url.searchParams.set("state", state);
+    res.set("Cache-Control", "no-store");
     res.redirect(url.toString());
   })
 );
 
-// Step 2: Instagram sends the user back here with a code.
+// ---------------------------------------------------------------------------
+// Step 2: Instagram redirects back with ?code&state (or ?error...).
+// ---------------------------------------------------------------------------
 instagramRouter.get(
   "/callback",
   wrap(async (req, res) => {
-    const code = typeof req.query.code === "string" ? req.query.code : undefined;
-    const state = typeof req.query.state === "string" ? req.query.state : undefined;
-    if (req.query.error || !code || !state) return res.redirect("/?instagram=denied");
+    const q = req.query;
+    const code = typeof q.code === "string" ? q.code : undefined;
+    const state = typeof q.state === "string" ? q.state : undefined;
+    const uid = req.user!.id;
 
-    // State is single-use and must belong to the logged-in user.
-    const used = await pool.query(
-      "DELETE FROM oauth_states WHERE state_hash = $1 AND user_id = $2 AND expires_at > now() RETURNING id",
-      [sha256(state), req.user!.id]
-    );
-    if (!used.rows[0]) return res.redirect("/?instagram=error");
+    // State is single-use, expires in 10 minutes and must belong to the logged-in user (CSRF protection).
+    // Consumed first, even on error, so a reloaded/replayed callback can never trigger a second exchange.
+    let stateOk = false;
+    if (state) {
+      const used = await pool.query(
+        "DELETE FROM oauth_states WHERE state_hash = $1 AND user_id = $2 AND expires_at > now() RETURNING id",
+        [sha256(state), uid]
+      );
+      stateOk = Boolean(used.rows[0]);
+    }
+
+    // User pressed cancel / denied permission on Instagram's screen.
+    if (q.error) {
+      const reason = String(q.error_reason ?? q.error);
+      return back(res, /denied|access_denied/i.test(reason) ? "denied" : "meta_rejected");
+    }
+    if (!code || !state) return back(res, "error");
+    if (!stateOk) return back(res, "invalid_state");
 
     try {
-      // Code -> short-lived token
-      const short = await igJson<{ access_token: string }>(
-        await fetch("https://api.instagram.com/oauth/access_token", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: env.INSTAGRAM_APP_ID,
-            client_secret: env.INSTAGRAM_APP_SECRET,
-            grant_type: "authorization_code",
-            redirect_uri: REDIRECT_URI,
-            code,
-          }),
-        })
-      );
+      // 1) code -> short-lived token (1 hour). Codes are single-use.
+      const shortRes = await igFetch<{
+        access_token?: string;
+        user_id?: string | number;
+        permissions?: string;
+        data?: { access_token?: string; user_id?: string | number; permissions?: string }[];
+      }>("https://api.instagram.com/oauth/access_token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: env.INSTAGRAM_APP_ID,
+          client_secret: env.INSTAGRAM_APP_SECRET,
+          grant_type: "authorization_code",
+          redirect_uri: REDIRECT_URI,
+          code,
+        }),
+      });
+      const short = shortRes.data?.[0] ?? shortRes;
+      if (!short.access_token) return back(res, "meta_rejected");
 
-      // Short-lived -> long-lived token (about 60 days)
-      const longUrl = new URL("https://graph.instagram.com/access_token");
+      // Granted permissions are reported by Meta; make sure publishing was really granted.
+      const granted = String(short.permissions ?? "");
+      if (granted && !granted.split(",").map((s) => s.trim()).includes(REQUIRED_PUBLISH_SCOPE)) {
+        return back(res, "missing_permission");
+      }
+
+      // 2) short-lived -> long-lived token (~60 days, refreshed automatically by the publisher).
+      const longUrl = new URL(`${GRAPH_HOST}/access_token`);
       longUrl.searchParams.set("grant_type", "ig_exchange_token");
       longUrl.searchParams.set("client_secret", env.INSTAGRAM_APP_SECRET);
       longUrl.searchParams.set("access_token", short.access_token);
-      const long = await igJson<{ access_token: string; expires_in: number }>(await fetch(longUrl));
+      const long = await igFetch<{ access_token: string; expires_in: number }>(longUrl.toString());
 
-      // Who is this account?
-      const meUrl = new URL("https://graph.instagram.com/v21.0/me");
+      // 3) Which professional account is this?
+      const meUrl = new URL(`${GRAPH}/me`);
       meUrl.searchParams.set("fields", "user_id,username,account_type");
       meUrl.searchParams.set("access_token", long.access_token);
-      const me = await igJson<{ user_id?: string; id?: string; username: string; account_type?: string }>(
-        await fetch(meUrl)
-      );
-      const igUserId = String(me.user_id ?? me.id);
+      const me = await igFetch<{ user_id?: string; id?: string; username?: string; account_type?: string }>(meUrl.toString());
 
-      // Save (encrypted). An IG account can belong to only one user.
+      const igUserId = String(me.user_id ?? me.id ?? short.user_id ?? "");
+      if (!igUserId || !me.username) return back(res, "error");
+      if (/personal/i.test(me.account_type ?? "")) return back(res, "not_professional");
+
+      // 4) Save encrypted. One Instagram account can belong to only one scheduler user.
       const saved = await pool.query(
         `INSERT INTO instagram_accounts
-           (user_id, instagram_user_id, username, account_type, access_token_encrypted, token_expires_at, scopes, status)
-         VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' seconds')::interval, $7, 'active')
+           (user_id, instagram_user_id, username, account_type, access_token_encrypted,
+            token_expires_at, token_refreshed_at, scopes, status, last_error)
+         VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' seconds')::interval, now(), $7, 'active', NULL)
          ON CONFLICT (instagram_user_id) DO UPDATE SET
            username = EXCLUDED.username,
            account_type = EXCLUDED.account_type,
            access_token_encrypted = EXCLUDED.access_token_encrypted,
            token_expires_at = EXCLUDED.token_expires_at,
+           token_refreshed_at = now(),
+           last_refresh_attempt_at = NULL,
            scopes = EXCLUDED.scopes,
-           status = 'active'
+           status = 'active',
+           last_error = NULL
          WHERE instagram_accounts.user_id = EXCLUDED.user_id
          RETURNING id`,
-        [
-          req.user!.id,
-          igUserId,
-          me.username,
-          me.account_type ?? null,
-          encryptToken(long.access_token),
-          String(long.expires_in),
-          SCOPES.join(","),
-        ]
+        [uid, igUserId, me.username, me.account_type ?? null, encryptToken(long.access_token), String(long.expires_in), SCOPES.join(",")]
       );
-      if (!saved.rows[0]) return res.redirect("/?instagram=taken");
-      res.redirect("/?instagram=connected");
+      if (!saved.rows[0]) return back(res, "taken");
+      return back(res, "connected");
     } catch (err) {
-      console.error("Instagram connect failed:", err);
-      res.redirect("/?instagram=error");
+      const msg = describeError(err);
+      console.error("Instagram connect failed:", msg);
+      if (err instanceof IgError && err.network) return back(res, "network");
+      if (/authorization code|code (has|is) (been )?(used|expired|invalid)|invalid.*code/i.test(msg)) return back(res, "invalid_code");
+      if (/developer role|tester|not authorized|invalid platform app|development mode/i.test(msg)) return back(res, "dev_mode");
+      return back(res, "meta_rejected");
     }
   })
 );
 
-// List the user's connected accounts (tokens are never returned).
+// ---------------------------------------------------------------------------
+// Connected accounts. Tokens are NEVER returned.
+// "state" tells the UI what to show: connected | expired | revoked.
+// ---------------------------------------------------------------------------
 instagramRouter.get(
   "/accounts",
   wrap(async (req, res) => {
     const { rows } = await pool.query(
-      `SELECT id, username, account_type, status, token_expires_at, connected_at
+      `SELECT id, username, account_type, token_expires_at, connected_at, last_used_at, last_error,
+              CASE
+                WHEN status = 'active' AND token_expires_at IS NOT NULL AND token_expires_at < now() THEN 'expired'
+                ELSE status
+              END AS status
        FROM instagram_accounts WHERE user_id = $1 ORDER BY connected_at DESC`,
       [req.user!.id]
     );
-    res.json({ accounts: rows });
+    res.json({
+      accounts: rows.map((a) => ({ ...a, last_error: a.last_error ? redact(String(a.last_error)) : null })),
+    });
   })
 );
 
-// Disconnect = delete the saved account and its token.
+// Disconnect = delete the saved account and its token (its waiting posts are removed with it).
 instagramRouter.delete(
   "/accounts/:id",
   wrap(async (req, res) => {
