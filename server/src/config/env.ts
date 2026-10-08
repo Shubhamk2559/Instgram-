@@ -18,6 +18,9 @@ const schema = z.object({
   INSTAGRAM_APP_ID: z.string().min(1, "INSTAGRAM_APP_ID is required"),
   INSTAGRAM_APP_SECRET: z.string().min(1, "INSTAGRAM_APP_SECRET is required"),
   TOKEN_ENCRYPTION_KEY: z.string().min(32, "TOKEN_ENCRYPTION_KEY must be at least 32 characters"),
+  // Instagram Graph API version. v21.0 is retired by Meta on 2027-01-21; v25.0 is supported until 2028.
+  // Set IG_API_VERSION=v21.0 in Koyeb to roll back instantly if ever needed.
+  IG_API_VERSION: z.string().regex(/^v\d+\.\d+$/, "IG_API_VERSION must look like v25.0").default("v25.0"),
   CLOUDINARY_CLOUD_NAME: z.string().min(1, "CLOUDINARY_CLOUD_NAME is required"),
   CLOUDINARY_API_KEY: z.string().min(1, "CLOUDINARY_API_KEY is required"),
   CLOUDINARY_API_SECRET: z.string().min(1, "CLOUDINARY_API_SECRET is required"),
