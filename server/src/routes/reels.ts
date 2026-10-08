@@ -92,6 +92,15 @@ reelsRouter.post(
   wrap(async (req, res) => {
     const parsed = z.object({ count: z.number().int().min(1).max(PLAN.batch) }).safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Invalid count" });
+    // Double-click / repeat guard: never create a second batch while posts are still waiting or being published.
+    const pending = await pool.query(
+      `SELECT 1 FROM reels WHERE user_id = $1
+       AND status IN ('scheduled', 'publishing', 'container_created', 'publish_requested') LIMIT 1`,
+      [req.user!.id]
+    );
+    if (pending.rows[0]) {
+      return res.status(409).json({ error: "Pehle ki posts abhi chal rahi hain. Unke khatam hone ka wait karo, phir test karo." });
+    }
     const n = await release(0, parsed.data.count, req.user!.id);
     res.json({ created: n });
   })
@@ -113,7 +122,8 @@ reelsRouter.get(
   "/",
   wrap(async (req, res) => {
     const { rows } = await pool.query(
-      `SELECT r.id, r.cover_url, r.caption, r.scheduled_at, r.status, r.error, a.username
+      `SELECT r.id, r.cover_url, r.caption, r.scheduled_at, r.error, a.username,
+              CASE WHEN r.status IN ('container_created', 'publish_requested') THEN 'publishing' ELSE r.status END AS status
        FROM reels r JOIN instagram_accounts a ON a.id = r.instagram_account_id
        WHERE r.user_id = $1
        ORDER BY r.scheduled_at DESC, r.created_at ASC LIMIT 100`,
