@@ -150,111 +150,180 @@ export default function Reels({ accounts: _accounts }: { accounts: Acc[] }) {
   const tgl = lib?.telegram;
 
   return (
-    <section>
-      <h2>Daily Plan</h2>
-      {lib ? (
-        <p className="muted">
-          Roz {lib.plan.slots.join(", ")} par har account pe {lib.plan.batch} reels. Connected accounts: {lib.accounts}.
-          Agle din wahi videos dobara shuru se.
-        </p>
-      ) : (
-        <p className="muted">Loading...</p>
-      )}
+    <>
+      {/* 1. Daily plan */}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">🗓️</div>
+          <div className="t">
+            <h2>Daily Plan</h2>
+            <small>Agle din wahi videos dobara shuru se</small>
+          </div>
+        </div>
+        {lib ? (
+          <>
+            <div className="tiles">
+              <div className="tile"><b>{lib.plan.slots.length}</b><small>Slots / day</small></div>
+              <div className="tile"><b>{lib.plan.batch}</b><small>Reels / slot</small></div>
+              <div className="tile"><b>{lib.accounts}</b><small>Accounts</small></div>
+            </div>
+            <div className="chips">
+              {lib.plan.slots.map((t) => <span className="chip" key={t}>⏰ {t}</span>)}
+            </div>
+          </>
+        ) : (
+          <p className="muted">Loading...</p>
+        )}
+      </section>
 
-      <h2>Telegram (videos yahan se aayengi)</h2>
-      {tgl && !tgl.enabled && <p className="msg bad">Koyeb mein TELEGRAM_BOT_TOKEN set nahi hai.</p>}
-      {tgl && tgl.enabled && (
-        <>
-          <p className="muted">
-            {tgl.linked ? "Telegram linked. Videos bot ko bhejte jao (max 20 MB each)." : "Link karne ke liye:"}
-          </p>
-          {!tgl.linked && (
-            <p className="muted">
-              1) Telegram mein @{tgl.bot ?? "apna bot"} kholo. 2) Ye message bhejo: <b>/start {tgl.code}</b> 3) Phir videos bhejo.
-            </p>
-          )}
-        </>
-      )}
+      {/* 2. Telegram */}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">✈️</div>
+          <div className="t">
+            <h2>Telegram</h2>
+            <small>Videos yahan se aayengi</small>
+          </div>
+        </div>
+        {tgl && !tgl.enabled && <p className="msg bad">Koyeb mein TELEGRAM_BOT_TOKEN set nahi hai.</p>}
+        {tgl && tgl.enabled && tgl.linked && (
+          <p className="msg good">Telegram linked. Videos bot ko bhejte jao (max 20 MB each).</p>
+        )}
+        {tgl && tgl.enabled && !tgl.linked && (
+          <ol className="steps">
+            <li><span>Telegram mein <b>@{tgl.bot ?? "apna bot"}</b> kholo</span></li>
+            <li><span>Ye message bhejo: <code>/start {tgl.code}</code></span></li>
+            <li><span>Phir videos bhejo</span></li>
+          </ol>
+        )}
+      </section>
 
-      <h2>Cover and Caption (sabke liye ek)</h2>
-      <form className="form" onSubmit={saveSettings} key={`c${cKey}`}>
-        {lib?.coverUrl && <img className="thumb" src={lib.coverUrl} alt="" />}
-        <label className="field">
-          Cover image (sirf JPG, 9:16 best, naya chunoge to purana replace hoga)
-          <input type="file" accept="image/jpeg" onChange={(e) => setCover(e.target.files?.[0] ?? null)} />
-        </label>
-        <textarea
-          placeholder="Caption"
-          rows={4}
-          maxLength={2200}
-          value={caption ?? lib?.caption ?? ""}
-          onChange={(e) => setCaption(e.target.value)}
-        />
-        {cError && <p className="msg bad">{cError}</p>}
-        {cStatus && <p className="msg good">{cStatus}</p>}
-        <button className="btn" disabled={cBusy}>{cBusy ? "Please wait..." : "Save caption and cover"}</button>
-      </form>
+      {/* 3. Cover and caption */}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">🖼️</div>
+          <div className="t">
+            <h2>Cover and Caption</h2>
+            <small>Sabke liye ek hi</small>
+          </div>
+        </div>
+        <form className="form" onSubmit={saveSettings} key={`c${cKey}`}>
+          {lib?.coverUrl && <img className="thumb cover-preview" src={lib.coverUrl} alt="" />}
+          <label className="field">
+            Cover image (sirf JPG, 9:16 best, naya chunoge to purana replace hoga)
+            <input type="file" accept="image/jpeg" onChange={(e) => setCover(e.target.files?.[0] ?? null)} />
+          </label>
+          <textarea
+            placeholder="Caption"
+            rows={4}
+            maxLength={2200}
+            value={caption ?? lib?.caption ?? ""}
+            onChange={(e) => setCaption(e.target.value)}
+          />
+          {cError && <p className="msg bad">{cError}</p>}
+          {cStatus && <p className="msg good">{cStatus}</p>}
+          <button className="btn mint full" disabled={cBusy}>{cBusy ? "Please wait..." : "Save caption and cover"}</button>
+        </form>
+      </section>
 
-      <h2>Videos ({lib?.items.length ?? 0} / {max})</h2>
-      {lib && lib.items.length === 0 && <p className="muted">Abhi koi video nahi. Telegram bot ko videos bhejo.</p>}
-      {lib && lib.items.length > 0 && (
-        <ul className="status">
-          {lib.items.map((v, i) => (
-            <li key={v.id} className="reel">
-              <div className="info">
-                <b>Video {i + 1}</b>
-                <small>
-                  Slot {lib.plan.slots[Math.floor(i / lib.plan.batch)] ?? "-"}
-                  {v.tg_size ? ` · ${(v.tg_size / 1048576).toFixed(1)} MB` : ""}
-                </small>
-              </div>
-              <button type="button" className="link" onClick={() => removeVideo(v.id)}>Remove</button>
-            </li>
-          ))}
-        </ul>
-      )}
+      {/* 4. Videos */}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">🎞️</div>
+          <div className="t">
+            <h2>Videos</h2>
+            <small>{lib?.items.length ?? 0} / {max} library mein</small>
+          </div>
+        </div>
+        {lib && lib.items.length === 0 && (
+          <div className="empty"><span className="big">📭</span>Abhi koi video nahi. Telegram bot ko videos bhejo.</div>
+        )}
+        {lib && lib.items.length > 0 && (
+          <ul className="status">
+            {lib.items.map((v, i) => (
+              <li key={v.id} className="reel">
+                <div className="info">
+                  <b>Video {i + 1}</b>
+                  <small>
+                    Slot {lib.plan.slots[Math.floor(i / lib.plan.batch)] ?? "-"}
+                    {v.tg_size ? ` · ${(v.tg_size / 1048576).toFixed(1)} MB` : ""}
+                  </small>
+                </div>
+                <button type="button" className="link bad-link" onClick={() => removeVideo(v.id)}>Remove</button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
-      <h2>Test</h2>
-      <p className="muted">Pehle {testCount} video abhi sab accounts par post hoga. Ye video aaj apne slot par dobara post hoga.</p>
-      <div className="row">
-        <input
-          type="number"
-          min={1}
-          max={lib?.plan.batch ?? 10}
-          value={testCount}
-          onChange={(e) => setTestCount(Math.max(1, Number(e.target.value) || 1))}
-        />
-        <button type="button" className="btn" onClick={testPost}>Test post now</button>
-      </div>
+      {/* 5. Test */}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">🧪</div>
+          <div className="t">
+            <h2>Test</h2>
+            <small>Pehle {testCount} video abhi sab accounts par post hoga</small>
+          </div>
+        </div>
+        <p className="muted">Ye video aaj apne slot par dobara post hoga.</p>
+        <div className="row">
+          <input
+            type="number"
+            min={1}
+            max={lib?.plan.batch ?? 10}
+            value={testCount}
+            onChange={(e) => setTestCount(Math.max(1, Number(e.target.value) || 1))}
+          />
+          <button type="button" className="btn pink" onClick={testPost}>Test post now</button>
+        </div>
+      </section>
 
-      <h2>Recent posts</h2>
-      {reels === null ? (
-        <p className="muted">Loading...</p>
-      ) : reels.length === 0 ? (
-        <p className="muted">No posts yet.</p>
-      ) : (
-        <ul className="status">
-          {reels.map((r) => (
-            <li key={r.id} className="reel">
-              {r.cover_url ? <img className="thumb" src={r.cover_url} alt="" /> : <div className="thumb" />}
-              <div className="info">
-                <b>@{r.username}</b>
-                <small>{new Date(r.scheduled_at).toLocaleString()}</small>
-                <span className={`badge ${r.status}`}>{r.status}</span>
-                {r.error && <small className="bad">{r.error}</small>}
-              </div>
-              {(r.status === "scheduled" || r.status === "failed") && (
-                <button type="button" className="link" onClick={() => removePost(r.id)}>Delete</button>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+      {/* 6. Recent posts */}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">📮</div>
+          <div className="t">
+            <h2>Recent posts</h2>
+            <small>Har 20 second mein refresh</small>
+          </div>
+        </div>
+        {reels === null ? (
+          <p className="muted">Loading...</p>
+        ) : reels.length === 0 ? (
+          <div className="empty"><span className="big">🌱</span>No posts yet.</div>
+        ) : (
+          <ul className="status">
+            {reels.map((r) => (
+              <li key={r.id} className="reel">
+                {r.cover_url ? <img className="thumb" src={r.cover_url} alt="" /> : <div className="thumb" />}
+                <div className="info">
+                  <b>@{r.username}</b>
+                  <small>{new Date(r.scheduled_at).toLocaleString()}</small>
+                  <span className={`badge ${r.status}`}>{r.status}</span>
+                  {r.error && <small className="bad">{r.error}</small>}
+                </div>
+                {(r.status === "scheduled" || r.status === "failed") && (
+                  <button type="button" className="link bad-link" onClick={() => removePost(r.id)}>Delete</button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
-      <h2>Danger zone</h2>
-      <button type="button" className="btn" style={{ background: "#dc2626" }} onClick={resetAll}>
-        Delete library and posts
-      </button>
-    </section>
+      {/* 7. Danger zone */}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">⚠️</div>
+          <div className="t">
+            <h2>Danger zone</h2>
+            <small>Ye undo nahi hota</small>
+          </div>
+        </div>
+        <button type="button" className="btn danger full" onClick={resetAll}>
+          Delete library and posts
+        </button>
+      </section>
+    </>
   );
 }
