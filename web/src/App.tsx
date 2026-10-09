@@ -64,10 +64,13 @@ function AuthForm({ onDone }: { onDone: (u: User) => void }) {
   }
 
   return (
-    <main className="wrap">
-      <h1>Reel Scheduler</h1>
-      <p className="muted">{mode === "login" ? "Log in to your account" : "Create your account"}</p>
-      <form className="form" onSubmit={submit}>
+    <main className="wrap auth">
+      <div className="hero">
+        <div className="icon">🎬</div>
+        <h1>Reel Scheduler</h1>
+        <p className="muted">{mode === "login" ? "Welcome back! Log in to continue" : "Create your account in a few seconds"}</p>
+      </div>
+      <form className="card form" onSubmit={submit}>
         <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" />
         <input
           type="password"
@@ -78,11 +81,13 @@ function AuthForm({ onDone }: { onDone: (u: User) => void }) {
           autoComplete={mode === "login" ? "current-password" : "new-password"}
         />
         {error && <p className="msg bad">{error}</p>}
-        <button className="btn" disabled={busy}>{busy ? "Please wait..." : mode === "login" ? "Log in" : "Sign up"}</button>
+        <button className="btn full" disabled={busy}>{busy ? "Please wait..." : mode === "login" ? "Log in" : "Sign up"}</button>
       </form>
-      <button className="link" onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); }}>
-        {mode === "login" ? "New here? Create an account" : "Already have an account? Log in"}
-      </button>
+      <div style={{ textAlign: "center" }}>
+        <button className="link" onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); }}>
+          {mode === "login" ? "New here? Create an account" : "Already have an account? Log in"}
+        </button>
+      </div>
     </main>
   );
 }
@@ -123,56 +128,82 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
   }
 
   const hasAccounts = Boolean(accounts && accounts.length > 0);
+  const needsReconnect = Boolean(accounts && accounts.some((a) => a.status !== "active"));
 
   return (
     <main className="wrap">
-      <div className="row">
-        <h1>Reel Scheduler</h1>
-        <button className="link" onClick={onLogout}>Log out</button>
-      </div>
-      <p className="muted">{user.email}</p>
+      <header className="card top">
+        <div className="row">
+          <div className="brand">
+            <div className="icon">🎬</div>
+            <div className="name">
+              <h1>Reel Scheduler</h1>
+              <small className="muted">{user.email}</small>
+            </div>
+          </div>
+          <button className="link" onClick={onLogout}>Log out</button>
+        </div>
+      </header>
+
       {notice && <p className={`msg ${notice.ok ? "good" : "bad"}`}>{notice.text}</p>}
 
-      <h2>Instagram</h2>
-      {accounts === null ? (
-        <p className="muted">Loading...</p>
-      ) : accounts.length === 0 ? (
-        <p className="muted">No account connected yet. Connect once and it stays connected.</p>
-      ) : (
-        <ul className="status">
-          {accounts.map((a) => {
-            const ok = a.status === "active";
-            return (
-              <li key={a.id}>
-                <span>
-                  @{a.username}
-                  <br />
-                  {ok ? (
-                    <small style={{ color: "#16a34a", opacity: 1 }}>● Connected{a.account_type ? ` · ${a.account_type.toLowerCase()}` : ""}</small>
-                  ) : (
-                    <small className="bad">⚠ Connection {a.status === "revoked" ? "was removed" : "expired"}</small>
-                  )}
-                </span>
-                <span>
-                  {!ok && (
-                    <button className="btn" disabled={connecting} onClick={startConnect}>Reconnect Instagram</button>
-                  )}
-                  <button className="link" onClick={() => disconnect(a.id)}>Disconnect</button>
-                </span>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-      {accounts && accounts.some((a) => a.status !== "active") && (
-        <p className="msg bad">Posting is paused for accounts that need reconnecting. Waiting posts resume automatically after you reconnect.</p>
-      )}
-      {accounts !== null && (
-        <button className="btn" disabled={connecting} onClick={startConnect}>
-          {connecting ? "Opening Instagram..." : hasAccounts ? "Connect another Instagram account" : "Connect Instagram"}
-        </button>
-      )}
-      {accounts && accounts.length > 0 && <Reels accounts={accounts} />}
+      <section className="card">
+        <div className="card-head">
+          <div className="icon">📸</div>
+          <div className="t">
+            <h2>Instagram</h2>
+            <small>Ek baar connect karo, connection save rehta hai</small>
+          </div>
+        </div>
+
+        {accounts === null ? (
+          <p className="muted">Loading...</p>
+        ) : accounts.length === 0 ? (
+          <div className="empty">
+            <span className="big">🔌</span>
+            Abhi koi account connected nahi hai.
+          </div>
+        ) : (
+          <ul className="status">
+            {accounts.map((a) => {
+              const ok = a.status === "active";
+              return (
+                <li key={a.id}>
+                  <div className="left">
+                    <div className="avatar">{a.username.slice(0, 1).toUpperCase()}</div>
+                    <div className="name">
+                      <b>@{a.username}</b>
+                      {ok ? (
+                        <small className="ok">● Connected{a.account_type ? ` · ${a.account_type.toLowerCase()}` : ""}</small>
+                      ) : (
+                        <small className="bad">⚠ Connection {a.status === "revoked" ? "was removed" : "expired"}</small>
+                      )}
+                    </div>
+                  </div>
+                  <div className="actions">
+                    {!ok && (
+                      <button className="btn pink" disabled={connecting} onClick={startConnect}>Reconnect Instagram</button>
+                    )}
+                    <button className="link bad-link" onClick={() => disconnect(a.id)}>Disconnect</button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {needsReconnect && (
+          <p className="msg bad">Posting paused for accounts that need reconnecting. Reconnect karte hi waiting posts apne aap chalu ho jayengi.</p>
+        )}
+
+        {accounts !== null && (
+          <button className="btn full" disabled={connecting} onClick={startConnect}>
+            {connecting ? "Opening Instagram..." : hasAccounts ? "＋ Connect another account" : "Connect Instagram"}
+          </button>
+        )}
+      </section>
+
+      {hasAccounts && <Reels accounts={accounts!} />}
     </main>
   );
 }
@@ -191,6 +222,6 @@ export default function App() {
     setUser(null);
   }
 
-  if (user === undefined) return <main className="wrap"><p className="muted">Loading...</p></main>;
+  if (user === undefined) return <main className="wrap"><p className="muted" style={{ textAlign: "center", marginTop: "30vh" }}>Loading...</p></main>;
   return user ? <Dashboard user={user} onLogout={logout} /> : <AuthForm onDone={setUser} />;
 }
