@@ -50,6 +50,8 @@ instagramRouter.get(
     url.searchParams.set("response_type", "code");
     url.searchParams.set("scope", SCOPES.join(","));
     url.searchParams.set("state", state);
+    // App ID and redirect URL are not secrets; logged so a mismatch with Meta's settings is easy to spot.
+    console.log(`Instagram connect: client_id=${env.INSTAGRAM_APP_ID} redirect_uri=${REDIRECT_URI}`);
     res.set("Cache-Control", "no-store");
     res.redirect(url.toString());
   })
