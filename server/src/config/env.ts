@@ -5,6 +5,10 @@ import { z } from "zod";
 // Load .env from repo root in local dev; in production real env vars are used.
 dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
 
+// Koyeb values are often pasted with stray spaces or quotes; Instagram then rejects the app as "Invalid platform app".
+const clean = (v: string) => v.trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+const cleaned = (msg: string) => z.string().transform(clean).pipe(z.string().min(1, msg));
+
 const schema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   PORT: z.coerce.number().int().positive().default(8000),
@@ -12,11 +16,12 @@ const schema = z.object({
   DATABASE_SSL: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   APP_BASE_URL: z
     .string()
-    .url()
-    .default("http://localhost:8000")
-    .transform((v) => v.replace(/\/+$/, "")),
-  INSTAGRAM_APP_ID: z.string().min(1, "INSTAGRAM_APP_ID is required"),
-  INSTAGRAM_APP_SECRET: z.string().min(1, "INSTAGRAM_APP_SECRET is required"),
+    .transform(clean)
+    .pipe(z.string().url())
+    .transform((v) => v.replace(/\/+$/, ""))
+    .default("http://localhost:8000"),
+  INSTAGRAM_APP_ID: cleaned("INSTAGRAM_APP_ID is required"),
+  INSTAGRAM_APP_SECRET: cleaned("INSTAGRAM_APP_SECRET is required"),
   TOKEN_ENCRYPTION_KEY: z.string().min(32, "TOKEN_ENCRYPTION_KEY must be at least 32 characters"),
   // Instagram Graph API version. v21.0 is retired by Meta on 2027-01-21; v25.0 is supported until 2028.
   // Set IG_API_VERSION=v21.0 in Koyeb to roll back instantly if ever needed.
@@ -36,3 +41,7 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
+
+if (env.NODE_ENV === "production" && /localhost|127\.0\.0\.1/.test(env.APP_BASE_URL)) {
+  console.warn("WARNING: APP_BASE_URL points to localhost. Set it to your public Koyeb URL, or Instagram login will fail.");
+}
