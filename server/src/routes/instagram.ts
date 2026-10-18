@@ -129,14 +129,15 @@ instagramRouter.get(
 
       const igUserId = String(me.user_id ?? me.id ?? short.user_id ?? "");
       if (!igUserId || !me.username) return back(res, "error");
+      const appScopedId = String(me.id ?? short.user_id ?? "") || null; // Meta callbacks may report this id instead of user_id
       if (/personal/i.test(me.account_type ?? "")) return back(res, "not_professional");
 
       // 4) Save encrypted. One Instagram account can belong to only one scheduler user.
       const saved = await pool.query(
         `INSERT INTO instagram_accounts
            (user_id, instagram_user_id, username, account_type, access_token_encrypted,
-            token_expires_at, token_refreshed_at, scopes, status, last_error)
-         VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' seconds')::interval, now(), $7, 'active', NULL)
+            token_expires_at, token_refreshed_at, scopes, status, last_error, app_scoped_id)
+         VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' seconds')::interval, now(), $7, 'active', NULL, $8)
          ON CONFLICT (instagram_user_id) DO UPDATE SET
            username = EXCLUDED.username,
            account_type = EXCLUDED.account_type,
@@ -145,11 +146,12 @@ instagramRouter.get(
            token_refreshed_at = now(),
            last_refresh_attempt_at = NULL,
            scopes = EXCLUDED.scopes,
+           app_scoped_id = EXCLUDED.app_scoped_id,
            status = 'active',
            last_error = NULL
          WHERE instagram_accounts.user_id = EXCLUDED.user_id
          RETURNING id`,
-        [uid, igUserId, me.username, me.account_type ?? null, encryptToken(long.access_token), String(long.expires_in), SCOPES.join(",")]
+        [uid, igUserId, me.username, me.account_type ?? null, encryptToken(long.access_token), String(long.expires_in), SCOPES.join(","), appScopedId]
       );
       if (!saved.rows[0]) return back(res, "taken");
       return back(res, "connected");

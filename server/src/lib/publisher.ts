@@ -14,11 +14,11 @@ function toMinutes(value: string | undefined, fallback: string): number {
 }
 const label = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 
-const SLOTS = (process.env.POST_SLOTS || "09:00,14:00,17:00,19:00,21:00")
+const SLOTS = (process.env.POST_SLOTS || "10:00,19:00")
   .split(",")
   .map((s) => toMinutes(s, "09:00"))
   .sort((a, b) => a - b);
-const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 10));
+const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 1));
 const GRACE_MIN = 60;
 
 export const PLAN = { slots: SLOTS.map(label), batch: BATCH, tz: TZ };
@@ -28,8 +28,11 @@ const MAX_ATTEMPTS = 3; // container-creation attempts per post (only safe, pre-
 const MAX_PARALLEL = 3; // different Instagram accounts processed at once (one post per account at a time)
 const STALE_MINUTES = 10; // an in-flight post with no heartbeat for this long is recovered
 const MISSED_HOURS = 12; // a waiting post older than this is dropped instead of posting very late
-// Meta allows 100 API-published posts per account per rolling 24h. Stay below it.
-const DAILY_CAP = Math.max(1, Math.min(100, Math.floor(Number(process.env.IG_DAILY_POST_CAP) || 90)));
+// Meta allows 100 API-published posts per account per rolling 24h, but running near that limit looks like spam
+// and puts the developer app at risk. Default is 10/day per account; 25 is a hard ceiling here.
+const DAILY_CAP = Math.max(1, Math.min(25, Math.floor(Number(process.env.IG_DAILY_POST_CAP) || 10)));
+// Never re-post the same video to the same user's accounts within this many days.
+const NO_REPEAT_DAYS = 60;
 // Meta recommends checking container status about once a minute for at most ~5 minutes. We start a bit earlier, then slow down.
 const POLL_DELAYS_S = [20, 30, 60, 60, 60, 60, 60, 60, 60, 60];
 
@@ -47,24 +50,44 @@ function localNow(): { date: string; minutes: number } {
   return { date: `${get("year")}-${get("month")}-${get("day")}`, minutes: Number(get("hour")) * 60 + Number(get("minute")) };
 }
 
-// Copies library videos [from, to) into posting jobs, one per active Instagram account.
+// Creates posting jobs from the library. Safety rules (these protect the Meta developer app):
+//  * every video goes to ONE account only (accounts of the same user never get the same video),
+//  * a video that was already posted/queued within NO_REPEAT_DAYS is skipped, so nothing is reposted daily,
+//  * each account gets (to - from) videos per call.
 export async function release(from: number, to: number, userId: string | null): Promise<number> {
-  const r = await pool.query(
-    `WITH ranked AS (
-       SELECT l.*, row_number() OVER (PARTITION BY l.user_id ORDER BY l.created_at, l.id) - 1 AS pos
-       FROM library l
-     )
-     INSERT INTO reels (user_id, instagram_account_id, video_url, video_public_id, tg_file_id, cover_url, caption, status, scheduled_at)
-     SELECT k.user_id, a.id, k.video_url, k.video_public_id, k.tg_file_id,
-            CASE WHEN s.cover_token IS NOT NULL THEN $4::text || s.cover_token || '.jpg' END,
-            COALESCE(s.caption, ''), 'scheduled', now()
-     FROM ranked k
-     JOIN instagram_accounts a ON a.user_id = k.user_id AND a.status = 'active'
-     LEFT JOIN queue_settings s ON s.user_id = k.user_id
-     WHERE k.pos >= $1 AND k.pos < $2 AND ($3::uuid IS NULL OR k.user_id = $3::uuid)`,
-    [from, to, userId, `${env.APP_BASE_URL}/api/public/cover/`]
+  const perAccount = Math.max(0, to - from);
+  if (perAccount === 0) return 0;
+  const accounts = await pool.query<{ id: string; user_id: string }>(
+    `SELECT id, user_id FROM instagram_accounts
+     WHERE status = 'active' AND ($1::uuid IS NULL OR user_id = $1::uuid)
+     ORDER BY user_id, connected_at, id`,
+    [userId]
   );
-  return r.rowCount ?? 0;
+  let created = 0;
+  for (const a of accounts.rows) {
+    // Sequential on purpose: each INSERT is visible to the next account's "already used" check.
+    const r = await pool.query(
+      `INSERT INTO reels (user_id, instagram_account_id, video_url, video_public_id, tg_file_id, cover_url, caption, status, scheduled_at)
+       SELECT k.user_id, $2::uuid, k.video_url, k.video_public_id, k.tg_file_id,
+              CASE WHEN s.cover_token IS NOT NULL THEN $4::text || s.cover_token || '.jpg' END,
+              COALESCE(s.caption, ''), 'scheduled', now()
+       FROM library k
+       LEFT JOIN queue_settings s ON s.user_id = k.user_id
+       WHERE k.user_id = $1::uuid
+         AND NOT EXISTS (
+           SELECT 1 FROM reels r
+           WHERE r.user_id = k.user_id
+             AND COALESCE(r.tg_file_id, r.video_url) = COALESCE(k.tg_file_id, k.video_url)
+             AND r.status <> 'failed'
+             AND r.created_at > now() - make_interval(days => $5::int)
+         )
+       ORDER BY k.created_at, k.id
+       LIMIT $3`,
+      [a.user_id, a.id, perAccount, `${env.APP_BASE_URL}/api/public/cover/`, NO_REPEAT_DAYS]
+    );
+    created += r.rowCount ?? 0;
+  }
+  return created;
 }
 
 async function promoteSlots() {
@@ -91,7 +114,7 @@ async function promoteSlots() {
     }
 
     await pool.query("DELETE FROM queue_runs WHERE ran_at < now() - interval '30 days'");
-    await pool.query("DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '7 days'");
+    await pool.query("DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '60 days'");
   }
 }
 
@@ -556,6 +579,9 @@ async function tick() {
 }
 
 export function startPublisher(): () => void {
+  if (SLOTS.length * BATCH > DAILY_CAP) {
+    console.warn(`WARNING: plan is ${SLOTS.length * BATCH} posts/account/day but the safety cap is ${DAILY_CAP}. Extra posts will wait. Lower POST_SLOTS / POST_BATCH_SIZE.`);
+  }
   console.log(`Plan: ${PLAN.slots.join(", ")} | ${BATCH} per account per slot | tz ${TZ} | daily cap ${DAILY_CAP}`);
   startTelegram(() => SLOTS.length * BATCH);
   const timer = setInterval(tick, 30_000);

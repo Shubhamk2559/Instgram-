@@ -9,6 +9,7 @@ import { downloadTelegramFile } from "./lib/telegram";
 import { healthRouter } from "./routes/health";
 import { authRouter, originGuard } from "./routes/auth";
 import { instagramRouter } from "./routes/instagram";
+import { metaRouter, pagesRouter } from "./routes/meta";
 import { reelsRouter } from "./routes/reels";
 
 export function createApp() {
@@ -26,6 +27,7 @@ export function createApp() {
     })
   );
   app.use(express.json({ limit: "1mb" }));
+  app.use(express.urlencoded({ extended: false, limit: "20kb" })); // Meta callbacks send signed_request as form data
 
   app.use("/api", originGuard);
   app.use("/api", healthRouter);
@@ -66,6 +68,8 @@ export function createApp() {
     }
   });
 
+  app.use("/api/meta", metaRouter); // deauthorize + data deletion callbacks (signature-verified, no login)
+  app.use(pagesRouter); // /privacy and /terms (required by Meta to go Live)
   app.use("/api/auth", authRouter);
   app.use("/api/instagram", instagramRouter);
   app.use("/api/reels", reelsRouter);
