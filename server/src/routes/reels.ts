@@ -1,7 +1,8 @@
 import express, { Router } from "express";
 import { z } from "zod";
 import { pool } from "../db/pool";
-import { PLAN, release } from "../lib/publisher";
+import { release } from "../lib/publisher";
+import { DAILY_CAP, LIBRARY_MAX, TZ, checkPlan, loadPlan, localNow, nextSlot, label, savePlan, slotsOf } from "../lib/plan";
 import { newToken } from "../lib/security";
 import { botUsername, pairCode, telegramEnabled } from "../lib/telegram";
 import { requireAuth, wrap } from "./auth";
@@ -14,20 +15,22 @@ reelsRouter.get(
   "/library",
   wrap(async (req, res) => {
     const uid = req.user!.id;
-    const items = await pool.query("SELECT id, tg_size FROM library WHERE user_id = $1 ORDER BY created_at, id", [uid]);
-    const st = await pool.query("SELECT caption, cover_token FROM queue_settings WHERE user_id = $1", [uid]);
-    const acc = await pool.query(
-      "SELECT count(*)::int AS n FROM instagram_accounts WHERE user_id = $1 AND status = 'active'",
-      [uid]
-    );
-    const link = await pool.query("SELECT 1 FROM telegram_links WHERE user_id = $1 LIMIT 1", [uid]);
+    const [cnt, st, acc, link, plan] = await Promise.all([
+      pool.query("SELECT count(*)::int AS n FROM library WHERE user_id = $1", [uid]),
+      pool.query("SELECT caption, cover_token FROM queue_settings WHERE user_id = $1", [uid]),
+      pool.query("SELECT count(*)::int AS n FROM instagram_accounts WHERE user_id = $1 AND status = 'active'", [uid]),
+      pool.query("SELECT 1 FROM telegram_links WHERE user_id = $1 LIMIT 1", [uid]),
+      loadPlan(uid),
+    ]);
     const token = st.rows[0]?.cover_token as string | undefined;
+    const slots = slotsOf(plan).map(label);
     res.json({
-      items: items.rows,
+      count: cnt.rows[0].n,
+      max: LIBRARY_MAX,
       caption: st.rows[0]?.caption ?? "",
       coverUrl: token ? `/api/public/cover/${token}.jpg` : null,
       accounts: acc.rows[0].n,
-      plan: PLAN,
+      plan: { ...plan, slots, perDay: slots.length * plan.perRun, cap: DAILY_CAP, tz: TZ, next: nextSlot(plan) },
       telegram: {
         enabled: telegramEnabled,
         linked: link.rows.length > 0,
@@ -35,6 +38,17 @@ reelsRouter.get(
         bot: await botUsername(),
       },
     });
+  })
+);
+
+// Save the posting plan (times or interval, reels per run, gaps).
+reelsRouter.put(
+  "/plan",
+  wrap(async (req, res) => {
+    const r = checkPlan(req.body);
+    if ("error" in r) return res.status(400).json({ error: r.error });
+    await savePlan(req.user!.id, r.plan);
+    res.json({ ok: true });
   })
 );
 
@@ -90,7 +104,7 @@ reelsRouter.post(
 reelsRouter.post(
   "/library/test",
   wrap(async (req, res) => {
-    const parsed = z.object({ count: z.number().int().min(1).max(PLAN.batch) }).safeParse(req.body);
+    const parsed = z.object({ count: z.number().int().min(1).max(5) }).safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Invalid count" });
     // Double-click / repeat guard: never create a second batch while posts are still waiting or being published.
     const pending = await pool.query(
@@ -101,7 +115,7 @@ reelsRouter.post(
     if (pending.rows[0]) {
       return res.status(409).json({ error: "Pehle ki posts abhi chal rahi hain. Unke khatam hone ka wait karo, phir test karo." });
     }
-    const n = await release(0, parsed.data.count, req.user!.id);
+    const n = await release(parsed.data.count, req.user!.id);
     res.json({ created: n });
   })
 );
@@ -117,19 +131,33 @@ reelsRouter.delete(
   })
 );
 
-// ---- Posts (one row per video per account) ----
+// ---- Posts: only a short summary + the latest few (keeps the dashboard light) ----
 reelsRouter.get(
   "/",
   wrap(async (req, res) => {
-    const { rows } = await pool.query(
-      `SELECT r.id, r.cover_url, r.caption, r.scheduled_at, r.error, a.username,
-              CASE WHEN r.status IN ('container_created', 'publish_requested') THEN 'publishing' ELSE r.status END AS status
-       FROM reels r JOIN instagram_accounts a ON a.id = r.instagram_account_id
-       WHERE r.user_id = $1
-       ORDER BY r.scheduled_at DESC, r.created_at ASC LIMIT 100`,
-      [req.user!.id]
-    );
-    res.json({ reels: rows });
+    const uid = req.user!.id;
+    const { date } = localNow();
+    const [list, today] = await Promise.all([
+      pool.query(
+        `SELECT r.id, r.scheduled_at, r.error, a.username,
+                CASE WHEN r.status IN ('container_created', 'publish_requested') THEN 'publishing' ELSE r.status END AS status
+         FROM reels r JOIN instagram_accounts a ON a.id = r.instagram_account_id
+         WHERE r.user_id = $1
+         ORDER BY r.scheduled_at DESC, r.created_at ASC LIMIT 12`,
+        [uid]
+      ),
+      pool.query(
+        `SELECT CASE WHEN status IN ('container_created', 'publish_requested', 'publishing') THEN 'publishing' ELSE status END AS s,
+                count(*)::int AS n
+         FROM reels
+         WHERE user_id = $1 AND (scheduled_at AT TIME ZONE $2::text)::date = $3::date
+         GROUP BY 1`,
+        [uid, TZ, date]
+      ),
+    ]);
+    const t: Record<string, number> = { published: 0, scheduled: 0, publishing: 0, failed: 0 };
+    for (const r of today.rows) t[r.s] = (t[r.s] ?? 0) + r.n;
+    res.json({ reels: list.rows, today: t });
   })
 );
 
