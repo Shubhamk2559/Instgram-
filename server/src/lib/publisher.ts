@@ -3,87 +3,70 @@ import { pool } from "../db/pool";
 import { IgError, describeError, igGet, igPost, refreshLongLivedToken } from "./instagram";
 import { decryptToken, encryptToken, sha256 } from "./security";
 import { startTelegram } from "./telegram";
+import { DAILY_CAP, LIBRARY_MAX, TZ, loadPlan, localNow, slotKey, slotsOf, type Plan } from "./plan";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// ---- Daily plan (change in Koyeb env vars; defaults below) ----
-const TZ = process.env.POST_TZ || "Asia/Kolkata";
-function toMinutes(value: string | undefined, fallback: string): number {
-  const m = /^(\d{1,2}):(\d{2})$/.exec((value ?? "").trim()) ?? /^(\d{1,2}):(\d{2})$/.exec(fallback)!;
-  return Number(m[1]) * 60 + Number(m[2]);
-}
-const label = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
-
-const SLOTS = (process.env.POST_SLOTS || "10:00,19:00")
-  .split(",")
-  .map((s) => toMinutes(s, "09:00"))
-  .sort((a, b) => a - b);
-const BATCH = Math.max(1, Math.floor(Number(process.env.POST_BATCH_SIZE) || 1));
-const GRACE_MIN = 60;
-
-export const PLAN = { slots: SLOTS.map(label), batch: BATCH, tz: TZ };
 
 // ---- Safety limits ----
 const MAX_ATTEMPTS = 3; // container-creation attempts per post (only safe, pre-publish steps are retried)
 const MAX_PARALLEL = 3; // different Instagram accounts processed at once (one post per account at a time)
 const STALE_MINUTES = 10; // an in-flight post with no heartbeat for this long is recovered
 const MISSED_HOURS = 12; // a waiting post older than this is dropped instead of posting very late
-// Meta allows 100 API-published posts per account per rolling 24h, but running near that limit looks like spam
-// and puts the developer app at risk. Default is 10/day per account; 25 is a hard ceiling here.
-const DAILY_CAP = Math.max(1, Math.min(25, Math.floor(Number(process.env.IG_DAILY_POST_CAP) || 10)));
-// Never re-post the same video to the same user's accounts within this many days.
-const NO_REPEAT_DAYS = 60;
 // Meta recommends checking container status about once a minute for at most ~5 minutes. We start a bit earlier, then slow down.
 const POLL_DELAYS_S = [20, 30, 60, 60, 60, 60, 60, 60, 60, 60];
 
-function localNow(): { date: string; minutes: number } {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date());
-  const get = (t: string) => parts.find((p) => p.type === t)!.value;
-  return { date: `${get("year")}-${get("month")}-${get("day")}`, minutes: Number(get("hour")) * 60 + Number(get("minute")) };
-}
+const GRACE_MIN = 60; // a slot is still fired up to this many minutes late (e.g. after a restart)
 
-// Creates posting jobs from the library. Safety rules (these protect the Meta developer app):
-//  * every video goes to ONE account only (accounts of the same user never get the same video),
-//  * a video that was already posted/queued within NO_REPEAT_DAYS is skipped, so nothing is reposted daily,
-//  * each account gets (to - from) videos per call.
-export async function release(from: number, to: number, userId: string | null): Promise<number> {
-  const perAccount = Math.max(0, to - from);
-  if (perAccount === 0) return 0;
-  const accounts = await pool.query<{ id: string; user_id: string }>(
-    `SELECT id, user_id FROM instagram_accounts
-     WHERE status = 'active' AND ($1::uuid IS NULL OR user_id = $1::uuid)
-     ORDER BY user_id, connected_at, id`,
+// Creates posting jobs for ONE user from the library. Rules (these protect the Meta developer app):
+//  * accounts of the same user never get the same video: each account gets different videos,
+//  * a video is used at most ONCE per day per user (never twice on one account, never on two accounts) - also enforced by a DB unique index,
+//  * videos rotate fairly: the one posted longest ago (or never) goes first, so the whole library is used before any repeat,
+//  * posts are spread out: `gapMin` between reels of one account, `staggerMin` between accounts.
+export async function release(perAccount: number, userId: string, planOverride?: Plan): Promise<number> {
+  if (perAccount <= 0) return 0;
+  const plan = planOverride ?? (await loadPlan(userId));
+  const accounts = await pool.query<{ id: string }>(
+    `SELECT id FROM instagram_accounts WHERE status = 'active' AND user_id = $1 ORDER BY connected_at, id`,
     [userId]
   );
+  const { date } = localNow();
   let created = 0;
-  for (const a of accounts.rows) {
-    // Sequential on purpose: each INSERT is visible to the next account's "already used" check.
+  for (let idx = 0; idx < accounts.rows.length; idx++) {
+    const a = accounts.rows[idx];
+    // Sequential on purpose: each INSERT is visible to the next account's "already used today" check.
     const r = await pool.query(
-      `INSERT INTO reels (user_id, instagram_account_id, video_url, video_public_id, tg_file_id, cover_url, caption, status, scheduled_at)
-       SELECT k.user_id, $2::uuid, k.video_url, k.video_public_id, k.tg_file_id,
+      `WITH pick AS (
+         SELECT k.user_id, k.video_url, k.video_public_id, k.tg_file_id,
+                COALESCE(k.tg_file_id, k.video_url) AS vkey,
+                row_number() OVER (ORDER BY lu.last_used NULLS FIRST, k.created_at, k.id) AS rn
+         FROM library k
+         LEFT JOIN LATERAL (
+           SELECT max(r.created_at) AS last_used FROM reels r
+           WHERE r.user_id = k.user_id AND r.status <> 'failed'
+             AND COALESCE(r.video_key, r.tg_file_id, r.video_url) = COALESCE(k.tg_file_id, k.video_url)
+         ) lu ON true
+         WHERE k.user_id = $1::uuid
+           AND COALESCE(k.tg_file_id, k.video_url) IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM reels r
+             WHERE r.user_id = k.user_id
+               AND COALESCE(r.video_key, r.tg_file_id, r.video_url) = COALESCE(k.tg_file_id, k.video_url)
+               AND COALESCE(r.post_day, (r.created_at AT TIME ZONE $6::text)::date) = $5::date
+           )
+         ORDER BY lu.last_used NULLS FIRST, k.created_at, k.id
+         LIMIT $3::int
+       )
+       INSERT INTO reels (user_id, instagram_account_id, video_url, video_public_id, tg_file_id, cover_url, caption,
+                          status, scheduled_at, video_key, post_day)
+       SELECT p.user_id, $2::uuid, p.video_url, p.video_public_id, p.tg_file_id,
               CASE WHEN s.cover_token IS NOT NULL THEN $4::text || s.cover_token || '.jpg' END,
-              COALESCE(s.caption, ''), 'scheduled', now()
-       FROM library k
-       LEFT JOIN queue_settings s ON s.user_id = k.user_id
-       WHERE k.user_id = $1::uuid
-         AND NOT EXISTS (
-           SELECT 1 FROM reels r
-           WHERE r.user_id = k.user_id
-             AND COALESCE(r.tg_file_id, r.video_url) = COALESCE(k.tg_file_id, k.video_url)
-             AND r.status <> 'failed'
-             AND r.created_at > now() - make_interval(days => $5::int)
-         )
-       ORDER BY k.created_at, k.id
-       LIMIT $3`,
-      [a.user_id, a.id, perAccount, `${env.APP_BASE_URL}/api/public/cover/`, NO_REPEAT_DAYS]
+              COALESCE(s.caption, ''), 'scheduled',
+              now() + make_interval(mins => (((p.rn - 1) * $7::int + $8::int))::int),
+              p.vkey, $5::date
+       FROM pick p
+       LEFT JOIN queue_settings s ON s.user_id = p.user_id
+       ON CONFLICT DO NOTHING`,
+      [userId, a.id, perAccount, `${env.APP_BASE_URL}/api/public/cover/`, date, TZ, plan.gapMin, idx * plan.staggerMin]
     );
     created += r.rowCount ?? 0;
   }
@@ -92,27 +75,31 @@ export async function release(from: number, to: number, userId: string | null): 
 
 async function promoteSlots() {
   const { date, minutes } = localNow();
-  for (let i = 0; i < SLOTS.length; i++) {
-    const s = SLOTS[i];
-    if (minutes < s || minutes - s > GRACE_MIN) continue;
-    const key = `${date} ${label(s)}`;
-    // Atomic claim: only one instance/tick can ever create the posts for a slot.
-    const claimed = await pool.query(
-      "INSERT INTO queue_runs (slot_key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING slot_key",
-      [key]
-    );
-    if (!claimed.rows[0]) continue;
-
-    try {
-      const n = await release(i * BATCH, (i + 1) * BATCH, null);
-      console.log(`Slot ${key}: created ${n} post(s)`);
-    } catch (err) {
-      // release() is one INSERT statement (all-or-nothing), so un-claiming the slot is safe and lets the next tick retry.
-      console.error(`Slot ${key} failed, will retry:`, describeError(err));
-      await pool.query("DELETE FROM queue_runs WHERE slot_key = $1", [key]).catch(() => {});
-      continue;
+  const users = await pool.query<{ user_id: string }>("SELECT DISTINCT user_id FROM instagram_accounts WHERE status = 'active'");
+  let claimedAny = false;
+  for (const u of users.rows) {
+    const plan = await loadPlan(u.user_id);
+    for (const s of slotsOf(plan)) {
+      if (minutes < s || minutes - s > GRACE_MIN) continue;
+      const key = slotKey(u.user_id, date, s);
+      // Atomic claim: only one instance/tick can ever create the posts for a slot.
+      const claimed = await pool.query(
+        "INSERT INTO queue_runs (slot_key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING slot_key",
+        [key]
+      );
+      if (!claimed.rows[0]) continue;
+      claimedAny = true;
+      try {
+        const n = await release(plan.perRun, u.user_id, plan);
+        console.log(`Slot ${key}: created ${n} post(s)`);
+      } catch (err) {
+        // release() is one INSERT per account, so un-claiming the slot is safe and lets the next tick retry.
+        console.error(`Slot ${key} failed, will retry:`, describeError(err));
+        await pool.query("DELETE FROM queue_runs WHERE slot_key = $1", [key]).catch(() => {});
+      }
     }
-
+  }
+  if (claimedAny) {
     await pool.query("DELETE FROM queue_runs WHERE ran_at < now() - interval '30 days'");
     await pool.query("DELETE FROM reels WHERE status IN ('published', 'failed') AND created_at < now() - interval '60 days'");
   }
@@ -579,11 +566,8 @@ async function tick() {
 }
 
 export function startPublisher(): () => void {
-  if (SLOTS.length * BATCH > DAILY_CAP) {
-    console.warn(`WARNING: plan is ${SLOTS.length * BATCH} posts/account/day but the safety cap is ${DAILY_CAP}. Extra posts will wait. Lower POST_SLOTS / POST_BATCH_SIZE.`);
-  }
-  console.log(`Plan: ${PLAN.slots.join(", ")} | ${BATCH} per account per slot | tz ${TZ} | daily cap ${DAILY_CAP}`);
-  startTelegram(() => SLOTS.length * BATCH);
+  console.log(`Plans are per user (dashboard). tz ${TZ} | daily cap ${DAILY_CAP}/account | library max ${LIBRARY_MAX}`);
+  startTelegram(() => LIBRARY_MAX);
   const timer = setInterval(tick, 30_000);
   setTimeout(tick, 5_000);
   return () => clearInterval(timer);
